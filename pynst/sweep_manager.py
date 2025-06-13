@@ -232,6 +232,8 @@ class SweepManager:
             Column names for the parameters. If None, uses `ivars.names`.
         critical_callback (Callable[[Exception], None], optional):
             A callback function for handling critical exceptions during measurement.
+        output_root (str, optional):
+            Root directory for output. If None, uses current working directory.
 
     Attributes:
         log_file (Path):
@@ -269,16 +271,42 @@ class SweepManager:
         measurement_func: Callable[[dict], List[pd.DataFrame]],
         ivars: pd.MultiIndex,
         meas_name: str, 
-        resume: bool = False,
+        resume: bool = True,
+        output_root: Optional[str] = None,  # <-- new parameter
         chunk_size: int = 10,
         param_col_names: Optional[List[str]] = None,
-        critical_callback: Optional[Callable[[Exception], None]] = None
+        critical_callback: Optional[Callable[[Exception], None]] = None,
     ):
+        """
+        Args:
+            measurement_func (Callable[[dict], List[pd.DataFrame]]):
+                A function that takes a dict of parameters and returns one or more DataFrames
+                containing measurement results.
+            ivars (pd.MultiIndex):
+                A MultiIndex representing all parameter combinations to be swept.
+            meas_name (str):
+                A name or path segment used for output directories and files.
+            output_root (str, optional): Root directory for output. If None, uses current working directory.
+            resume (bool, optional):
+                Whether to resume from a previous log. If False, all existing measurement data will be cleared.
+            chunk_size (int, optional):
+                The number of parameter combinations to store per chunk file. Defaults to 10.
+            param_col_names (List[str], optional):
+                Column names for the parameters. If None, uses `ivars.names`.
+            critical_callback (Callable[[Exception], None], optional):
+                A callback function for handling critical exceptions during measurement.
+        """
         
         if not ivars.is_unique:
             raise ValueError("Sweep index contains duplicate values. Please sanitize, e.g. using .unique() before passing")
         
-        output_dir = Path(meas_name)
+        # Determine output root
+        if output_root is not None:
+            output_root_path = Path(output_root)
+        else:
+            output_root_path = Path.cwd()
+        output_dir = output_root_path / meas_name
+
         self.log_file = output_dir/"simlog.tsv"
         self.errlog_file = output_dir/"traceback.log"
 
