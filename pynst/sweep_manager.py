@@ -103,10 +103,20 @@ class OnDiskChunkManager(DataManager):
         tmp_path = self.output_dir / tmp_filename
 
         # schreibe DataFrames in .tmp
-        with pd.HDFStore(tmp_path, mode='w') as store:
+        # Optimierte Kompression
+        with pd.HDFStore(tmp_path, mode='w', complevel=9, complib='blosc') as store:
             for block_idx, df_list in self.df_blocks.items():
                 combined = pd.concat(df_list, axis=0, join='outer')
-                store.put(f"block_{block_idx}", combined, format='table')
+                idx_cols = list(combined.index.names)
+
+                store.put(
+                    f"block_{block_idx}",
+                    combined,
+                    format="table",
+                    data_columns=idx_cols,
+                    complevel=9,
+                    complib="blosc",
+                )
 
         final_filename = f"chunk_{self.chunks_written}.h5"
         final_path = self.output_dir / final_filename
@@ -467,21 +477,32 @@ class SweepManager:
     def get_results(self, include_nan: bool = True) -> List[Any]:
         return self.data_manager.get_results(include_nan=include_nan)
 
-    def partial_merge(self, merged_file: str, remove_chunks: bool = False) -> None:
+    def partial_merge(self, merged_file: str, remove_chunks: bool = False, force_merge_into_existing: bool = False) -> None:
         """
         Liest alle Chunks, appends sie in 'merged_file', 
         zeigt dabei einen Fortschrittsbalken.
         """
         # TODO: Die Ausgabe dieser Funktion ist durch das Append unnötig groß. Das sollte irgendwie defragmentiert werden. Am besten ohne alles in den ram zu laden
+        if os.path.isfile(merged_file) and not force_merge_into_existing:
+            raise FileExistsError(f"Output File {merged_file} already exist. Use \"force_merge_into_existing=True\" to force this Operation")
         self.data_manager.finalize()
         chunk_files = sorted(Path(self.data_manager.output_dir).glob("chunk_*.h5"))
         pbar = tqdm(total=len(chunk_files), desc="Merging chunks", leave=True)
-        with pd.HDFStore(merged_file, mode='a') as out_store:
+        with pd.HDFStore(merged_file, mode='a', complevel=9, complib='blosc') as out_store:
             for cf in chunk_files:
                 with pd.HDFStore(cf, 'r') as in_store:
                     for key in in_store.keys():
                         df = in_store[key]
-                        out_store.append(key, df, format='table')
+                        idx_cols = list(df.index.names)
+
+                        out_store.append(
+                            key,
+                            df,
+                            format="table",
+                            data_columns=idx_cols,
+                            complevel=9,
+                            complib="blosc",
+                        )
                 if remove_chunks:
                     cf.unlink()
                 pbar.update(1)
