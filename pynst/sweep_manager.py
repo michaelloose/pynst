@@ -116,6 +116,7 @@ class OnDiskChunkManager(DataManager):
                     data_columns=idx_cols,
                     complevel=9,
                     complib="blosc",
+                    min_itemsize=128,
                 )
 
         final_filename = f"chunk_{self.chunks_written}.h5"
@@ -502,6 +503,8 @@ class SweepManager:
                             data_columns=idx_cols,
                             complevel=9,
                             complib="blosc",
+                            # min_itemsize={"values_block_1": 64}  # or a suitable value for your longest string
+                            min_itemsize=128,
                         )
                 if remove_chunks:
                     cf.unlink()
