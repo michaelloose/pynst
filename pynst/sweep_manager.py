@@ -34,6 +34,7 @@ import time
 import traceback
 from typing import Any, Callable, Literal
 import uuid
+import warnings
 import weakref
 
 import numpy as np
@@ -50,11 +51,21 @@ from .data_model import (
 
 
 BlockMode = Literal["list", "mapping"]
+MergeStrategy = Literal["fixed", "streaming"]
 MeasurementResult = Sequence[Any] | Mapping[str, Any]
 BlockMap = dict[str, pd.DataFrame]
 SWEEP_CONTRACT_VERSION = 3
 SUPPORTED_SWEEP_CONTRACT_VERSIONS = {1, 2, SWEEP_CONTRACT_VERSION}
 RUN_MANIFEST_VERSION = 1
+_FIXED_MERGE_MEMORY_FACTOR = 4.0
+_FIXED_MERGE_BASE_OVERHEAD_BYTES = 256 * 1024**2
+_FIXED_MERGE_INDEX_OVERHEAD_PER_ROW = 256
+_FIXED_MERGE_MIN_RESERVE_BYTES = 512 * 1024**2
+_FIXED_MERGE_RESERVE_FRACTION = 0.15
+_FIXED_MERGE_SCAN_ROWS = 100_000
+_STREAMING_MERGE_BATCH_ROWS = 100_000
+_CHUNK_VALIDATION_BATCH_ROWS = 100_000
+_MISSING_INDEX_VALUE = object()
 
 
 class CriticalMeasurementError(Exception):
@@ -158,6 +169,53 @@ def _replace_file(temporary: Path, target: Path) -> None:
             time.sleep(delays[attempt])
 
 
+def _available_memory_bytes() -> int | None:
+    """Return currently available physical memory using only the stdlib."""
+    if os.name == "nt":
+        import ctypes
+
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        try:
+            success = ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                ctypes.byref(status)
+            )
+        except (AttributeError, OSError):
+            return None
+        return int(status.ullAvailPhys) if success else None
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    if page_size <= 0 or available_pages <= 0:
+        return None
+    return page_size * available_pages
+
+
+def _format_bytes(value: int) -> str:
+    amount = float(max(0, value))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024.0 or unit == "TiB":
+            return f"{amount:.1f} {unit}"
+        amount /= 1024.0
+    raise AssertionError("unreachable")
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_bytes(text.encode("utf-8"))
@@ -232,6 +290,17 @@ def _is_data_block_key(key: str) -> bool:
         and "/" not in normalised
         and not normalised.startswith("__metadata__")
     )
+
+
+def _canonical_index_value(value: Any) -> Any:
+    """Make scalar missing values compare equal across validation batches."""
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        missing = False
+    if isinstance(missing, (bool, np.bool_)) and bool(missing):
+        return _MISSING_INDEX_VALUE
+    return value
 
 
 def _data_block_keys(store: pd.HDFStore) -> list[str]:
@@ -2150,105 +2219,150 @@ class SweepManager:
 
             inferred_by_block: list[set[int]] = []
             for block_name in sorted(block_names, key=_block_sort_key):
-                frame = store[block_name]
-                if frame.empty:
-                    raise RuntimeError(
-                        f"Chunk {path.name!r} block {block_name!r} is empty."
+                storer = store.get_storer(block_name)
+                is_table = bool(storer.is_table)
+                if is_table:
+                    frames: Iterable[pd.DataFrame] = store.select(
+                        block_name,
+                        chunksize=_CHUNK_VALIDATION_BATCH_ROWS,
                     )
-                if not frame.index.is_unique:
-                    raise RuntimeError(
-                        f"Chunk {path.name!r} block {block_name!r} has "
-                        "duplicate index rows."
-                    )
-                missing = [
-                    name
-                    for name in self.param_col_names
-                    if name not in frame.index.names
-                ]
-                if missing:
-                    raise RuntimeError(
-                        f"Chunk {path.name!r} block {block_name!r} is "
-                        f"missing sweep levels {missing!r}."
-                    )
-                if self._persisted_result_schema is not None:
-                    expected = self._persisted_result_schema[block_name]
-                    local_names = [
+                else:
+                    frames = (store[block_name],)
+
+                observed_rows = 0
+                block_sequences: set[int] = set()
+                seen_index_values: set[Any] = set()
+                for frame in frames:
+                    observed_rows += len(frame)
+                    if not frame.index.is_unique:
+                        raise RuntimeError(
+                            f"Chunk {path.name!r} block {block_name!r} has "
+                            "duplicate index rows."
+                        )
+                    if is_table:
+                        try:
+                            index_values = {
+                                tuple(
+                                    _canonical_index_value(value)
+                                    for value in row
+                                )
+                                for row in frame.index.to_frame(
+                                    index=False
+                                ).itertuples(index=False, name=None)
+                            }
+                        except TypeError as error:
+                            raise RuntimeError(
+                                f"Chunk {path.name!r} block "
+                                f"{block_name!r} has unhashable index "
+                                "values."
+                            ) from error
+                        if seen_index_values & index_values:
+                            raise RuntimeError(
+                                f"Chunk {path.name!r} block "
+                                f"{block_name!r} has duplicate index rows "
+                                "across validation batches."
+                            )
+                        seen_index_values.update(index_values)
+
+                    missing = [
                         name
-                        for name in frame.index.names
-                        if name not in self.param_col_names
+                        for name in self.param_col_names
+                        if name not in frame.index.names
                     ]
-                    if local_names != expected["index_names"]:
+                    if missing:
                         raise RuntimeError(
-                            f"Chunk {path.name!r} block {block_name!r} "
-                            "has incompatible local index names."
+                            f"Chunk {path.name!r} block {block_name!r} is "
+                            f"missing sweep levels {missing!r}."
                         )
-                    actual_index_dtypes = [
-                        str(frame.index.get_level_values(name).dtype)
-                        for name in local_names
-                    ]
-                    expected_index_dtypes = expected.get("index_dtypes")
-                    if (
-                        expected_index_dtypes is not None
-                        and actual_index_dtypes != expected_index_dtypes
-                    ):
-                        raise RuntimeError(
-                            f"Chunk {path.name!r} block {block_name!r} "
-                            "has incompatible local index dtypes."
+                    if self._persisted_result_schema is not None:
+                        expected = self._persisted_result_schema[block_name]
+                        local_names = [
+                            name
+                            for name in frame.index.names
+                            if name not in self.param_col_names
+                        ]
+                        if local_names != expected["index_names"]:
+                            raise RuntimeError(
+                                f"Chunk {path.name!r} block {block_name!r} "
+                                "has incompatible local index names."
+                            )
+                        actual_index_dtypes = [
+                            str(frame.index.get_level_values(name).dtype)
+                            for name in local_names
+                        ]
+                        expected_index_dtypes = expected.get("index_dtypes")
+                        if (
+                            expected_index_dtypes is not None
+                            and actual_index_dtypes != expected_index_dtypes
+                        ):
+                            raise RuntimeError(
+                                f"Chunk {path.name!r} block {block_name!r} "
+                                "has incompatible local index dtypes."
+                            )
+                        actual_index_specs = [
+                            _dtype_spec(
+                                frame.index.get_level_values(name).dtype
+                            )
+                            for name in local_names
+                        ]
+                        expected_index_specs = expected.get(
+                            "index_dtype_specs"
                         )
-                    actual_index_specs = [
-                        _dtype_spec(frame.index.get_level_values(name).dtype)
-                        for name in local_names
-                    ]
-                    expected_index_specs = expected.get("index_dtype_specs")
-                    if (
-                        expected_index_specs is not None
-                        and actual_index_specs != expected_index_specs
-                    ):
-                        raise RuntimeError(
-                            f"Chunk {path.name!r} block {block_name!r} "
-                            "has incompatible local index dtype semantics."
-                        )
-                    if [str(name) for name in frame.columns] != expected["columns"]:
-                        raise RuntimeError(
-                            f"Chunk {path.name!r} block {block_name!r} "
-                            "has incompatible columns."
-                        )
-                    expected_dtypes = expected.get("dtypes")
-                    if (
-                        expected_dtypes is not None
-                        and [str(dtype) for dtype in frame.dtypes]
-                        != expected_dtypes
-                    ):
-                        raise RuntimeError(
-                            f"Chunk {path.name!r} block {block_name!r} "
-                            "has incompatible dtypes."
-                        )
-                    expected_dtype_specs = expected.get("dtype_specs")
-                    actual_dtype_specs = [
-                        _dtype_spec(frame[column].dtype)
-                        for column in frame.columns
-                    ]
-                    if (
-                        expected_dtype_specs is not None
-                        and actual_dtype_specs != expected_dtype_specs
-                    ):
-                        raise RuntimeError(
-                            f"Chunk {path.name!r} block {block_name!r} "
-                            "has incompatible dtype semantics."
-                        )
-                parameter_rows = (
-                    frame.index.to_frame(index=False)[self.param_col_names]
-                    .drop_duplicates()
-                )
-                inferred_by_block.append(
-                    {
+                        if (
+                            expected_index_specs is not None
+                            and actual_index_specs != expected_index_specs
+                        ):
+                            raise RuntimeError(
+                                f"Chunk {path.name!r} block {block_name!r} "
+                                "has incompatible local index dtype "
+                                "semantics."
+                            )
+                        if (
+                            [str(name) for name in frame.columns]
+                            != expected["columns"]
+                        ):
+                            raise RuntimeError(
+                                f"Chunk {path.name!r} block {block_name!r} "
+                                "has incompatible columns."
+                            )
+                        expected_dtypes = expected.get("dtypes")
+                        if (
+                            expected_dtypes is not None
+                            and [str(dtype) for dtype in frame.dtypes]
+                            != expected_dtypes
+                        ):
+                            raise RuntimeError(
+                                f"Chunk {path.name!r} block {block_name!r} "
+                                "has incompatible dtypes."
+                            )
+                        expected_dtype_specs = expected.get("dtype_specs")
+                        actual_dtype_specs = [
+                            _dtype_spec(frame[column].dtype)
+                            for column in frame.columns
+                        ]
+                        if (
+                            expected_dtype_specs is not None
+                            and actual_dtype_specs != expected_dtype_specs
+                        ):
+                            raise RuntimeError(
+                                f"Chunk {path.name!r} block {block_name!r} "
+                                "has incompatible dtype semantics."
+                            )
+                    parameter_rows = frame.index.to_frame(index=False)[
+                        self.param_col_names
+                    ].drop_duplicates()
+                    block_sequences.update(
                         self._sequence_for_values(row)
                         for row in parameter_rows.itertuples(
                             index=False,
                             name=None,
                         )
-                    }
-                )
+                    )
+                if observed_rows == 0:
+                    raise RuntimeError(
+                        f"Chunk {path.name!r} block {block_name!r} is empty."
+                    )
+                inferred_by_block.append(block_sequences)
 
         if not sequence_indices:
             if not inferred_by_block:
@@ -3569,19 +3683,24 @@ class SweepManager:
             )
         return target
 
-    def _prepare_merge_target(
+    def _validate_merge_target_ready(
         self,
         merged_file: str | Path,
         *,
         overwrite: bool,
-    ) -> tuple[Path, Path]:
+    ) -> Path:
+        """Check target policy without creating a directory or temp file."""
         target = self._validate_merge_target_location(merged_file)
         if target.exists() and not overwrite:
             raise FileExistsError(
                 f"Output file {target} already exists. Set "
-                "force_merge_into_existing=True to rebuild it."
+                "overwrite=True to rebuild it."
             )
+        return target
 
+    @staticmethod
+    def _create_merge_temporary(target: Path) -> Path:
+        """Create a private temporary file beside a validated target."""
         target.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{target.name}.",
@@ -3589,8 +3708,7 @@ class SweepManager:
             dir=target.parent,
         )
         os.close(descriptor)
-        temporary = Path(temporary_name)
-        return target, temporary
+        return Path(temporary_name)
 
     def _validate_retirement_target(self, merged_file: str | Path) -> Path:
         target = self._validate_merge_target_location(merged_file)
@@ -3683,29 +3801,149 @@ class SweepManager:
         for chunk_file in chunk_files:
             with pd.HDFStore(chunk_file, mode="r") as source:
                 for key in _data_block_keys(source):
-                    frame = source[key]
-                    columns_to_drop = projected_columns.get(key, ())
-                    if columns_to_drop:
-                        frame = frame.drop(
-                            columns=list(columns_to_drop),
-                            errors="ignore",
+                    storer = source.get_storer(key)
+                    if storer.is_table:
+                        frames: Iterable[pd.DataFrame] = source.select(
+                            key,
+                            chunksize=_STREAMING_MERGE_BATCH_ROWS,
                         )
-                    flat = frame.reset_index()
-                    block_sizes = required[key]
-                    for column in flat.columns:
-                        series = flat[column]
-                        if series.dtype != np.dtype("object"):
-                            continue
-                        non_missing = series.dropna()
-                        observed = max(
-                            (len(str(value)) for value in non_missing),
-                            default=0,
-                        )
-                        block_sizes[str(column)] = max(
-                            block_sizes.get(str(column), 128),
-                            observed,
-                        )
+                    else:
+                        frames = (source[key],)
+                    for frame in frames:
+                        columns_to_drop = projected_columns.get(key, ())
+                        if columns_to_drop:
+                            frame = frame.drop(
+                                columns=list(columns_to_drop),
+                                errors="ignore",
+                            )
+                        flat = frame.reset_index()
+                        block_sizes = required[key]
+                        for column in flat.columns:
+                            series = flat[column]
+                            if series.dtype != np.dtype("object"):
+                                continue
+                            non_missing = series.dropna()
+                            observed = max(
+                                (
+                                    len(str(value).encode("utf-8"))
+                                    for value in non_missing
+                                ),
+                                default=0,
+                            )
+                            block_sizes[str(column)] = max(
+                                block_sizes.get(str(column), 128),
+                                observed,
+                            )
         return dict(required)
+
+    @staticmethod
+    def _fixed_merge_memory_estimate(
+        chunk_files: Sequence[Path],
+        projected_columns: Mapping[str, Sequence[str]],
+    ) -> tuple[str, int, int]:
+        """Estimate peak RAM for the largest block of a fixed merge.
+
+        Table chunks are scanned in bounded slices so object payloads and
+        MultiIndex memory are included in ``DataFrame.memory_usage(deep=True)``.
+        Legacy fixed chunks are read one chunk at a time.  The peak estimate
+        accounts for the source frame list, concatenated frame, HDF
+        serialisation, index validation and a fixed pandas/PyTables overhead.
+        """
+        logical_bytes: dict[str, int] = defaultdict(int)
+        rows_by_block: dict[str, int] = defaultdict(int)
+        for chunk_file in chunk_files:
+            with pd.HDFStore(chunk_file, mode="r") as source:
+                for key in _data_block_keys(source):
+                    storer = source.get_storer(key)
+                    if storer.is_table:
+                        frames: Iterable[pd.DataFrame] = source.select(
+                            key,
+                            chunksize=_FIXED_MERGE_SCAN_ROWS,
+                        )
+                    else:
+                        frames = (source[key],)
+                    for frame in frames:
+                        columns_to_drop = projected_columns.get(key, ())
+                        if columns_to_drop:
+                            frame = frame.drop(
+                                columns=list(columns_to_drop),
+                                errors="ignore",
+                            )
+                        logical_bytes[key.strip("/")] += int(
+                            frame.memory_usage(
+                                index=True,
+                                deep=True,
+                            ).sum()
+                        )
+                        rows_by_block[key.strip("/")] += len(frame)
+
+        if not logical_bytes:
+            raise ValueError("No measurement blocks found in committed chunks.")
+        required_by_block = {
+            name: (
+                int(np.ceil(block_bytes * _FIXED_MERGE_MEMORY_FACTOR))
+                + rows_by_block[name]
+                * _FIXED_MERGE_INDEX_OVERHEAD_PER_ROW
+                + _FIXED_MERGE_BASE_OVERHEAD_BYTES
+            )
+            for name, block_bytes in logical_bytes.items()
+        }
+        block_name, required_bytes = max(
+            required_by_block.items(),
+            key=lambda item: item[1],
+        )
+        block_bytes = logical_bytes[block_name]
+        return block_name, block_bytes, required_bytes
+
+    def _ensure_fixed_merge_memory(
+        self,
+        chunk_files: Sequence[Path],
+        projected_columns: Mapping[str, Sequence[str]],
+    ) -> tuple[str, int, int, int]:
+        """Reject a fixed merge that cannot retain safe RAM headroom."""
+        try:
+            block_name, block_bytes, required_bytes = (
+                self._fixed_merge_memory_estimate(
+                    chunk_files,
+                    projected_columns,
+                )
+            )
+        except MemoryError as error:
+            raise MemoryError(
+                "Could not estimate fixed-merge memory without exhausting "
+                "RAM. Retry with merge(..., strategy='streaming')."
+            ) from error
+
+        available_bytes = _available_memory_bytes()
+        if available_bytes is None:
+            raise MemoryError(
+                "Fixed merge cannot determine currently available physical "
+                "memory on this platform, so its allocation safety cannot "
+                "be verified. Retry with merge(..., strategy='streaming')."
+            )
+
+        reserve_bytes = max(
+            _FIXED_MERGE_MIN_RESERVE_BYTES,
+            int(available_bytes * _FIXED_MERGE_RESERVE_FRACTION),
+        )
+        usable_bytes = max(0, available_bytes - reserve_bytes)
+        if required_bytes > usable_bytes:
+            raise MemoryError(
+                "Fixed merge is estimated to need "
+                f"{_format_bytes(required_bytes)} working memory for block "
+                f"{block_name!r} ({_format_bytes(block_bytes)} logical "
+                f"source data), but only {_format_bytes(available_bytes)} "
+                "is currently available and "
+                f"{_format_bytes(reserve_bytes)} is retained as safety "
+                "headroom. Retry with merge(..., strategy='streaming'); "
+                "source chunks were not modified."
+            )
+        return (
+            block_name,
+            block_bytes,
+            required_bytes,
+            available_bytes,
+        )
 
     def partial_merge(
         self,
@@ -3716,48 +3954,39 @@ class SweepManager:
         *,
         require_complete: bool = True,
     ) -> None:
-        """Stream committed chunks into a table-format HDF artifact.
+        """Deprecated alias for ``merge(strategy='streaming')``."""
+        warnings.warn(
+            "partial_merge() is deprecated; use merge(..., "
+            "strategy='streaming', overwrite=...) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.merge(
+            merged_file,
+            remove_chunks=remove_chunks,
+            strategy="streaming",
+            overwrite=force_merge_into_existing,
+            require_complete=require_complete,
+            drop_columns=drop_columns,
+        )
 
-        Incomplete runs are rejected unless ``require_complete=False`` is
-        supplied explicitly. Source chunks can only be retired after a
-        complete and deeply validated merge.
-        """
-        self._ensure_storage_usable()
-        self._validate_merge_target_location(merged_file)
-        if remove_chunks:
-            self._validate_retirement_target(merged_file)
-        self._acquire_current_run()
-        target_lock = self._merge_target_lock(merged_file)
-        try:
-            target_lock.acquire()
-            self._partial_merge_locked(
-                merged_file,
-                remove_chunks=remove_chunks,
-                force_merge_into_existing=force_merge_into_existing,
-                drop_columns=drop_columns,
-                require_complete=require_complete,
-            )
-        finally:
-            target_lock.release()
-            self._run_lock.release()
-
-    def _partial_merge_locked(
+    def _merge_streaming_locked(
         self,
         merged_file: str | Path,
         *,
         remove_chunks: bool,
-        force_merge_into_existing: bool,
+        overwrite: bool,
         drop_columns: Mapping[str, Sequence[str]] | None,
         require_complete: bool,
     ) -> None:
         """Stream chunks into one table-format HDF file.
 
         The output is built in a temporary file and atomically moved into
-        place. ``force_merge_into_existing=True`` rebuilds an existing target;
-        it does not append duplicate chunks to it. ``drop_columns`` projects
-        named blocks to a stable schema while reading without modifying the
-        source chunks. Block names may be supplied with or without a leading
-        slash, and columns absent from a block are ignored.
+        place. ``overwrite=True`` rebuilds an existing target; it does not
+        append duplicate chunks to it. ``drop_columns`` projects named blocks
+        to a stable schema while reading without modifying the source chunks.
+        Block names may be supplied with or without a leading slash, and
+        columns absent from a block are ignored.
         """
         if remove_chunks and not require_complete:
             raise ValueError(
@@ -3765,6 +3994,10 @@ class SweepManager:
             )
         if remove_chunks:
             self._validate_retirement_target(merged_file)
+        target = self._validate_merge_target_ready(
+            merged_file,
+            overwrite=overwrite,
+        )
         chunk_files = self._prepare_chunks_for_merge(
             require_complete=require_complete
         )
@@ -3772,10 +4005,6 @@ class SweepManager:
         # or scanning all chunk payloads.
         self._build_sweep_metadata(drop_columns=drop_columns)
 
-        target, temporary = self._prepare_merge_target(
-            merged_file,
-            overwrite=force_merge_into_existing,
-        )
         projected_columns = {
             "/" + block_name.strip("/"): tuple(columns)
             for block_name, columns in (drop_columns or {}).items()
@@ -3784,13 +4013,15 @@ class SweepManager:
             chunk_files,
             projected_columns,
         )
+        temporary = self._create_merge_temporary(target)
 
-        progress = tqdm(
-            total=len(chunk_files),
-            desc="Merging chunks",
-            leave=True,
-        )
+        progress: Any | None = None
         try:
+            progress = tqdm(
+                total=len(chunk_files),
+                desc="Merging chunks",
+                leave=True,
+            )
             with pd.HDFStore(
                 temporary,
                 mode="w",
@@ -3803,22 +4034,33 @@ class SweepManager:
                         mode="r",
                     ) as source:
                         for key in _data_block_keys(source):
-                            frame = source[key]
-                            columns_to_drop = projected_columns.get(key, ())
-                            if columns_to_drop:
-                                frame = frame.drop(
-                                    columns=list(columns_to_drop),
-                                    errors="ignore",
+                            storer = source.get_storer(key)
+                            if storer.is_table:
+                                frames = source.select(
+                                    key,
+                                    chunksize=_STREAMING_MERGE_BATCH_ROWS,
                                 )
-                            output.append(
-                                key,
-                                frame,
-                                format="table",
-                                data_columns=list(frame.index.names),
-                                complevel=9,
-                                complib="blosc",
-                                min_itemsize=min_itemsize.get(key, {}),
-                            )
+                            else:
+                                frames = (source[key],)
+                            for frame in frames:
+                                columns_to_drop = projected_columns.get(
+                                    key,
+                                    (),
+                                )
+                                if columns_to_drop:
+                                    frame = frame.drop(
+                                        columns=list(columns_to_drop),
+                                        errors="ignore",
+                                    )
+                                output.append(
+                                    key,
+                                    frame,
+                                    format="table",
+                                    data_columns=list(frame.index.names),
+                                    complevel=9,
+                                    complib="blosc",
+                                    min_itemsize=min_itemsize.get(key, {}),
+                                )
                     progress.update(1)
 
                 self._write_metadata(
@@ -3832,18 +4074,19 @@ class SweepManager:
             _fsync_file(temporary)
             _replace_file(temporary, target)
 
-        except Exception:
+        except BaseException:
             if temporary.exists():
                 temporary.unlink()
             raise
         finally:
-            progress.close()
+            if progress is not None:
+                progress.close()
 
         if remove_chunks:
             self._archive_after_merge(target, chunk_files)
 
         print(
-            f"Partial merge done -> {target}, "
+            f"Streaming merge done -> {target}, "
             f"remove_chunks={remove_chunks}"
         )
 
@@ -3852,10 +4095,31 @@ class SweepManager:
         merged_file: str | Path,
         remove_chunks: bool = False,
         *,
+        strategy: MergeStrategy = "fixed",
         overwrite: bool = False,
         require_complete: bool = True,
+        drop_columns: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
-        """Merge chunks block-wise, using table storage for extension dtypes."""
+        """Merge committed chunks using a fixed or streaming strategy.
+
+        ``strategy='fixed'`` is the default and merges one complete block in
+        memory before writing it once.  A conservative RAM preflight runs
+        before the output file is created.  Pandas extension dtypes that fixed
+        HDF cannot represent transparently use table storage for that block.
+
+        ``strategy='streaming'`` appends bounded source batches to HDF tables
+        and never materialises a complete result block.  Peak RAM still
+        depends on the configured source chunk size and the exact index set
+        retained by deep output validation.
+        """
+        if not isinstance(strategy, str) or strategy not in (
+            "fixed",
+            "streaming",
+        ):
+            raise ValueError(
+                "merge strategy must be 'fixed' or 'streaming', found "
+                f"{strategy!r}."
+            )
         self._ensure_storage_usable()
         self._validate_merge_target_location(merged_file)
         if remove_chunks:
@@ -3864,23 +4128,34 @@ class SweepManager:
         target_lock = self._merge_target_lock(merged_file)
         try:
             target_lock.acquire()
-            self._merge_locked(
-                merged_file,
-                remove_chunks=remove_chunks,
-                overwrite=overwrite,
-                require_complete=require_complete,
-            )
+            if strategy == "fixed":
+                self._merge_fixed_locked(
+                    merged_file,
+                    remove_chunks=remove_chunks,
+                    overwrite=overwrite,
+                    require_complete=require_complete,
+                    drop_columns=drop_columns,
+                )
+            else:
+                self._merge_streaming_locked(
+                    merged_file,
+                    remove_chunks=remove_chunks,
+                    overwrite=overwrite,
+                    drop_columns=drop_columns,
+                    require_complete=require_complete,
+                )
         finally:
             target_lock.release()
             self._run_lock.release()
 
-    def _merge_locked(
+    def _merge_fixed_locked(
         self,
         merged_file: str | Path,
         *,
         remove_chunks: bool,
         overwrite: bool,
         require_complete: bool,
+        drop_columns: Mapping[str, Sequence[str]] | None,
     ) -> None:
         """Merge each complete block in memory into an optimized HDF file.
 
@@ -3894,29 +4169,46 @@ class SweepManager:
             )
         if remove_chunks:
             self._validate_retirement_target(merged_file)
-        chunk_files = self._prepare_chunks_for_merge(
-            require_complete=require_complete
-        )
-
-        target, temporary = self._prepare_merge_target(
+        target = self._validate_merge_target_ready(
             merged_file,
             overwrite=overwrite,
         )
-
-        block_names: list[str] = []
-        for chunk_file in chunk_files:
-            with pd.HDFStore(chunk_file, mode="r") as store:
-                for key in _data_block_keys(store):
-                    name = key.strip("/")
-                    if name not in block_names:
-                        block_names.append(name)
-
-        progress = tqdm(
-            block_names,
-            desc="Merging by block",
-            leave=True,
+        chunk_files = self._prepare_chunks_for_merge(
+            require_complete=require_complete
         )
+        merge_metadata = self._build_sweep_metadata(
+            drop_columns=drop_columns
+        )
+        projected_columns = {
+            "/" + block_name.strip("/"): tuple(columns)
+            for block_name, columns in (drop_columns or {}).items()
+        }
+        (
+            largest_block,
+            _logical_bytes,
+            required_bytes,
+            available_bytes,
+        ) = self._ensure_fixed_merge_memory(
+            chunk_files,
+            projected_columns,
+        )
+        print(
+            "Fixed merge RAM preflight: "
+            f"{_format_bytes(required_bytes)} estimated for block "
+            f"{largest_block!r}; {_format_bytes(available_bytes)} "
+            "currently available."
+        )
+
+        temporary = self._create_merge_temporary(target)
+        block_names = list(merge_metadata.blocks)
+
+        progress = None
         try:
+            progress = tqdm(
+                block_names,
+                desc="Merging by block",
+                leave=True,
+            )
             with pd.HDFStore(temporary, mode="w") as output:
                 for block_name in progress:
                     frames: list[pd.DataFrame] = []
@@ -3928,7 +4220,17 @@ class SweepManager:
                             mode="r",
                         ) as source:
                             if hdf_key in source.keys():
-                                frames.append(source[hdf_key])
+                                frame = source[hdf_key]
+                                columns_to_drop = projected_columns.get(
+                                    hdf_key,
+                                    (),
+                                )
+                                if columns_to_drop:
+                                    frame = frame.drop(
+                                        columns=list(columns_to_drop),
+                                        errors="ignore",
+                                    )
+                                frames.append(frame)
 
                     if not frames:
                         continue
@@ -3937,7 +4239,7 @@ class SweepManager:
                         frames,
                         axis=0,
                         join="outer",
-                    ).sort_index()
+                    )
 
                     has_extension_dtype = any(
                         isinstance(
@@ -3969,7 +4271,10 @@ class SweepManager:
                     del merged, frames
                     gc.collect()
 
-                self._write_metadata(output)
+                self._write_metadata(
+                    output,
+                    drop_columns=drop_columns,
+                )
 
             from .dataset import GenericSweepDataset
 
@@ -3977,17 +4282,26 @@ class SweepManager:
             _fsync_file(temporary)
             _replace_file(temporary, target)
 
-        except Exception:
+        except MemoryError as error:
+            if temporary.exists():
+                temporary.unlink()
+            raise MemoryError(
+                "Fixed merge exhausted memory despite the conservative "
+                "preflight. Retry with merge(..., strategy='streaming'); "
+                "source chunks were not modified."
+            ) from error
+        except BaseException:
             if temporary.exists():
                 temporary.unlink()
             raise
         finally:
-            progress.close()
+            if progress is not None:
+                progress.close()
 
         if remove_chunks:
             self._archive_after_merge(target, chunk_files)
 
-        print(f"Optimized merge done -> {target}")
+        print(f"Fixed merge done -> {target}")
 
     @staticmethod
     def read_merged_metadata(

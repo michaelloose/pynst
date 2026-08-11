@@ -38,9 +38,16 @@
   werden anschließend erneut ausgelöst. Fehler beim Speichern sind kritische
   Laufabbrüche und keine gewöhnlichen fehlgeschlagenen Messpunkte.
 - `run()` meldet nur einen vollständig committeten Sweep als erfolgreich.
-  `merge()` und `partial_merge()` verlangen standardmäßig Vollständigkeit;
-  partielle Diagnoseartefakte benötigen `require_complete=False`.
-- `drop_columns` aktualisiert beim partiellen Merge auch die Blockmetadaten.
+  `merge()` verlangt standardmäßig Vollständigkeit; partielle
+  Diagnoseartefakte benötigen `require_complete=False`.
+- `merge(strategy="fixed" | "streaming")` konsolidiert beide Merge-Pfade.
+  `partial_merge()` ist ein deprecated Kompatibilitätswrapper für die
+  Streaming-Strategie. `drop_columns` aktualisiert bei beiden Strategien auch
+  die Blockmetadaten.
+- Der Fixed-Merge prüft vor dem Erzeugen des Zielartefakts konservativ den
+  Speicherbedarf des größten Blocks gegen den aktuell verfügbaren physischen
+  RAM und verweist bei unzureichendem oder unbekanntem Budget explizit auf die
+  Streaming-Strategie.
   Leere Messresultate, instabile Listenpositionen und leere Sweep-Grids werden
   früh abgewiesen.
 - `remove_chunks=True` setzt nach einem tief validierten Merge zuerst einen

@@ -366,7 +366,8 @@ class BaseSweepDataset(ABC):
                     continue
                 hdf_key = f"/{key}"
                 storer = store.get_storer(hdf_key)
-                if storer.is_table:
+                is_table = bool(storer.is_table)
+                if is_table:
                     frames: Iterable[pd.DataFrame] = store.select(
                         hdf_key,
                         chunksize=100_000,
@@ -384,6 +385,8 @@ class BaseSweepDataset(ABC):
                             f"{key!r}: stored index contains duplicate "
                             "entries."
                         )
+                    if not is_table:
+                        continue
                     try:
                         index_values = {
                             tuple(

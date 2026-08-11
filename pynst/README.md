@@ -186,19 +186,47 @@ Domain libraries should subclass `BaseSweepDataset` and implement
 
 ## Merge behaviour
 
-`partial_merge()` creates a table-format merged file without loading complete
-blocks into RAM.
+`merge()` has two explicit strategies:
 
-`merge()` creates a block-wise optimized merged file and preserves the full
-MultiIndex. It uses fixed-format storage when possible and transparently falls
-back to table format for pandas extension dtypes such as categorical levels.
+```python
+# Default: concatenate one complete block in RAM and write it once.
+manager.merge("merged.h5", strategy="fixed")
 
-Both methods write to a temporary file first and replace the target only after
-a successful, durable write. By default both require a complete run;
+# Low-memory path: append bounded batches to HDF tables.
+manager.merge("merged.h5", strategy="streaming")
+```
+
+`strategy="fixed"` is the default. It preserves the full MultiIndex and uses
+fixed-format HDF storage whenever pandas can represent the block that way.
+Extension dtypes such as categorical levels transparently fall back to table
+storage. Before creating the output file, PyNST scans the projected source
+table frames in bounded slices (legacy fixed chunks one chunk at a time),
+estimates the peak memory needed for the largest block plus concatenation,
+serialisation and validation overhead, and compares that estimate with
+currently available physical RAM. If the allocation cannot be verified safely,
+it raises `MemoryError` and recommends `strategy="streaming"`; it never changes
+strategy implicitly.
+
+`strategy="streaming"` never materialises a complete result block. Its peak
+memory still depends on the configured source chunk size and on the exact
+index set retained during deep validation.
+
+Both strategies preserve committed chunk order and therefore produce the same
+row order. After a failed point is filled by a later resume, physical row order
+can differ from the original sweep order; the named MultiIndex, not physical
+row position, is authoritative.
+
+The historical `partial_merge()` API is a deprecated compatibility wrapper
+for `merge(strategy="streaming")`; its old argument order remains supported
+during the deprecation period.
+
+Both strategies write to a temporary file first and replace the target only
+after a successful, durable write. By default they require a complete run;
 `require_complete=False` is the explicit diagnostic escape hatch for a partial
 artifact. Merge targets are locked across runs and may not overwrite chunks or
 run-control files. Random private temporary names prevent collisions with user
-files. `drop_columns` may not remove every dependent variable from a block.
+files. `drop_columns` is supported by both strategies and may not remove every
+dependent variable from a block.
 
 `remove_chunks=True` is permitted only for a complete merge. The merged file is
 deeply validated, then its path, hash and size are committed to the manifest as

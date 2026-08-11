@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -2390,8 +2391,12 @@ def test_partial_merge_prescans_string_width_and_keeps_sources_on_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    long_index = "index-" + "i" * 350
-    long_value = "value-" + "v" * 400
+    # Each value is fewer than the default 128 characters but exceeds
+    # 128 bytes in UTF-8.  PyTables sizes string columns in bytes.
+    long_index = "ü" * 100
+    long_value = "界" * 100
+    assert len(long_index) < 128 < len(long_index.encode("utf-8"))
+    assert len(long_value) < 128 < len(long_value.encode("utf-8"))
 
     def measurement(params: dict[str, Any]):
         is_second = params["point"] == 2
@@ -2449,6 +2454,720 @@ def test_partial_merge_prescans_string_width_and_keeps_sources_on_failure(
     } == source_bytes
     manifest = json.loads(manager.manifest_file.read_text(encoding="utf-8"))
     assert manifest["state"] != "archived"
+
+
+def _metadata_without_merge_time(dataset: GenericSweepDataset) -> dict[str, Any]:
+    values = dataset.metadata.to_dict()
+    values.pop("merged_at", None)
+    return values
+
+
+def test_fixed_default_and_streaming_merge_are_semantically_equivalent(
+    tmp_path: Path,
+) -> None:
+    manager = SweepManager(
+        measurement_func=lambda params: {
+            "measurement": pd.DataFrame(
+                {
+                    "voltage": [float(params["point"])],
+                    "current": [float(params["point"]) / 10.0],
+                },
+                index=pd.Index([0], name="sample"),
+            )
+        },
+        ivars=_grid(3, 1, 2),
+        meas_name="merge_strategy_equivalence",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+        metadata={
+            "operator": "offline-test",
+            "blocks": {
+                "measurement": {
+                    "description": "strategy equivalence block",
+                    "variables": {
+                        "voltage": {"unit": "V"},
+                        "current": {"unit": "A"},
+                    },
+                }
+            },
+        },
+    )
+    assert manager.run() is True
+    fixed_file = tmp_path / "strategy_fixed.h5"
+    streaming_file = tmp_path / "strategy_streaming.h5"
+
+    manager.merge(fixed_file)
+    manager.merge(streaming_file, strategy="streaming")
+
+    fixed = GenericSweepDataset(fixed_file)
+    streaming = GenericSweepDataset(streaming_file)
+    assert fixed.block_names == streaming.block_names == ("measurement",)
+    pd.testing.assert_frame_equal(
+        fixed.get_block("measurement"),
+        streaming.get_block("measurement"),
+        check_exact=True,
+    )
+    assert (
+        fixed.get_block("measurement")
+        .index.get_level_values("point")
+        .tolist()
+        == [3, 1, 2]
+    )
+    pd.testing.assert_frame_equal(
+        fixed.read_log(),
+        streaming.read_log(),
+        check_exact=True,
+    )
+    assert _metadata_without_merge_time(fixed) == _metadata_without_merge_time(
+        streaming
+    )
+    fixed.validate_storage(deep=True)
+    streaming.validate_storage(deep=True)
+
+    with pd.HDFStore(fixed_file, mode="r") as store:
+        assert store.get_storer("measurement").is_table is False
+    with pd.HDFStore(streaming_file, mode="r") as store:
+        assert store.get_storer("measurement").is_table is True
+
+
+def test_partial_merge_alias_warns_and_preserves_legacy_call_signature(
+    tmp_path: Path,
+) -> None:
+    manager = SweepManager(
+        measurement_func=lambda params: {
+            "measurement": pd.DataFrame(
+                {"keep": [1.0], "drop": [2.0]},
+                index=pd.Index([0], name="sample"),
+            )
+        },
+        ivars=_grid(1),
+        meas_name="partial_merge_legacy_signature",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    positional_target = tmp_path / "legacy_positional.h5"
+    keyword_target = tmp_path / "legacy_keyword.h5"
+
+    with pytest.warns(DeprecationWarning, match="strategy='streaming'"):
+        manager.partial_merge(
+            positional_target,
+            False,
+            False,
+            {"measurement": ["drop"]},
+        )
+    with pytest.warns(DeprecationWarning, match="strategy='streaming'"):
+        manager.partial_merge(
+            merged_file=keyword_target,
+            remove_chunks=False,
+            force_merge_into_existing=False,
+            drop_columns={"measurement": ["drop"]},
+            require_complete=True,
+        )
+
+    for target in (positional_target, keyword_target):
+        dataset = GenericSweepDataset(target)
+        assert dataset.get_block("measurement").columns.tolist() == ["keep"]
+        assert dataset.get_block_metadata("measurement").dvars == ["keep"]
+        dataset.validate_storage(deep=True)
+        with pd.HDFStore(target, mode="r") as store:
+            assert store.get_storer("measurement").is_table is True
+
+
+def test_merge_strategies_share_committed_order_after_resume_gap(
+    tmp_path: Path,
+) -> None:
+    def first_pass(params: dict[str, Any]):
+        if params["point"] == 0:
+            raise RuntimeError("intentional first-pass gap")
+        return _mapping_result(float(params["point"]))
+
+    ivars = _grid(0, 1)
+    first = SweepManager(
+        measurement_func=first_pass,
+        ivars=ivars,
+        meas_name="merge_resume_gap_order",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert first.run() is False
+    first.close()
+
+    resumed = SweepManager(
+        measurement_func=lambda params: _mapping_result(
+            float(params["point"])
+        ),
+        ivars=ivars,
+        meas_name="merge_resume_gap_order",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=True,
+    )
+    assert resumed.run() is True
+    fixed_file = tmp_path / "resume_gap_fixed.h5"
+    streaming_file = tmp_path / "resume_gap_streaming.h5"
+    resumed.merge(fixed_file)
+    resumed.merge(streaming_file, strategy="streaming")
+
+    fixed = GenericSweepDataset(fixed_file).get_block("measurement")
+    streaming = GenericSweepDataset(streaming_file).get_block("measurement")
+    pd.testing.assert_frame_equal(fixed, streaming, check_exact=True)
+    assert fixed.index.get_level_values("point").tolist() == [1, 0]
+
+
+@pytest.mark.parametrize(
+    "invalid_strategy",
+    ["adaptive", []],
+    ids=["unknown_string", "unhashable_list"],
+)
+def test_invalid_merge_strategy_is_rejected_before_any_mutation(
+    tmp_path: Path,
+    invalid_strategy: Any,
+) -> None:
+    manager = SweepManager(
+        measurement_func=lambda params: _mapping_result(),
+        ivars=_grid(1),
+        meas_name="invalid_merge_strategy",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    target = tmp_path / "invalid_strategy.h5"
+    before = _snapshot_tree(tmp_path)
+
+    with pytest.raises(ValueError, match="strategy|fixed|streaming"):
+        manager.merge(target, strategy=invalid_strategy)
+
+    assert not target.exists()
+    assert _snapshot_tree(tmp_path) == before
+
+
+def test_fixed_memory_preflight_boundary_rejects_and_streaming_bypasses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pynst.sweep_manager as sweep_manager_module
+
+    manager = SweepManager(
+        measurement_func=lambda params: _mapping_result(),
+        ivars=_grid(1, 2),
+        meas_name="merge_memory_boundary",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    source_before = _snapshot_tree(manager.output_dir)
+    one_gib = 1024**3
+    usable_after_reserve = one_gib - 512 * 1024**2
+
+    monkeypatch.setattr(
+        manager,
+        "_fixed_merge_memory_estimate",
+        lambda chunk_files, projected_columns: (
+            "measurement",
+            1,
+            usable_after_reserve + 1,
+        ),
+    )
+    monkeypatch.setattr(
+        sweep_manager_module,
+        "_available_memory_bytes",
+        lambda: one_gib,
+    )
+    fixed_target = tmp_path / "memory_boundary_fixed.h5"
+
+    with pytest.raises(MemoryError, match="streaming|headroom|memory"):
+        manager.merge(fixed_target)
+
+    assert not fixed_target.exists()
+    assert _snapshot_tree(manager.output_dir) == source_before
+
+    exact_target = tmp_path / "memory_boundary_exact.h5"
+    monkeypatch.setattr(
+        manager,
+        "_fixed_merge_memory_estimate",
+        lambda chunk_files, projected_columns: (
+            "measurement",
+            1,
+            usable_after_reserve,
+        ),
+    )
+    manager.merge(exact_target)
+    GenericSweepDataset(exact_target).validate_storage(deep=True)
+
+    streaming_target = tmp_path / "memory_boundary_streaming.h5"
+    manager.merge(streaming_target, strategy="streaming")
+    dataset = GenericSweepDataset(streaming_target)
+    dataset.validate_storage(deep=True)
+    with pd.HDFStore(streaming_target, mode="r") as store:
+        assert store.get_storer("measurement").is_table is True
+    assert _snapshot_tree(manager.output_dir) == source_before
+
+
+def test_unknown_available_memory_rejects_fixed_but_not_streaming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pynst.sweep_manager as sweep_manager_module
+
+    manager = SweepManager(
+        measurement_func=lambda params: _mapping_result(),
+        ivars=_grid(1, 2),
+        meas_name="merge_unknown_available_memory",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    source_before = _snapshot_tree(manager.output_dir)
+    monkeypatch.setattr(
+        sweep_manager_module,
+        "_available_memory_bytes",
+        lambda: None,
+    )
+    fixed_target = tmp_path / "unknown_memory_fixed.h5"
+
+    with pytest.raises(MemoryError, match="determine|streaming|memory"):
+        manager.merge(fixed_target)
+
+    assert not fixed_target.exists()
+    assert _snapshot_tree(manager.output_dir) == source_before
+
+    streaming_target = tmp_path / "unknown_memory_streaming.h5"
+    manager.merge(streaming_target, strategy="streaming")
+    GenericSweepDataset(streaming_target).validate_storage(deep=True)
+    assert _snapshot_tree(manager.output_dir) == source_before
+
+
+def test_fixed_memory_estimate_uses_largest_deep_block_not_file_size(
+    tmp_path: Path,
+) -> None:
+    import pynst.sweep_manager as sweep_manager_module
+
+    payload = "highly-compressible-" + "x" * 4096
+
+    def measurement(_params: dict[str, Any]):
+        return {
+            "large": pd.DataFrame(
+                {"payload": [payload] * 2000},
+                index=pd.Index(range(2000), name="sample"),
+            ),
+            "small": pd.DataFrame(
+                {"value": [1.0]},
+                index=pd.Index([0], name="sample"),
+            ),
+        }
+
+    manager = SweepManager(
+        measurement_func=measurement,
+        ivars=_grid(1),
+        meas_name="fixed_memory_deep_largest_block",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    chunk_files = sorted(manager.output_dir.glob("chunk_*.h5"))
+    assert len(chunk_files) == 1
+
+    with pd.HDFStore(chunk_files[0], mode="r") as store:
+        deep_bytes = {
+            key.strip("/"): int(
+                store[key].memory_usage(index=True, deep=True).sum()
+            )
+            for key in ("/large", "/small")
+        }
+        large_rows = len(store["/large"])
+
+    block, logical_bytes, required_bytes = (
+        manager._fixed_merge_memory_estimate(chunk_files, {})
+    )
+    assert block == "large"
+    assert logical_bytes == deep_bytes["large"]
+    assert logical_bytes == max(deep_bytes.values())
+    assert logical_bytes < sum(deep_bytes.values())
+    assert logical_bytes > chunk_files[0].stat().st_size
+    assert required_bytes == (
+        int(logical_bytes * sweep_manager_module._FIXED_MERGE_MEMORY_FACTOR)
+        + large_rows
+        * sweep_manager_module._FIXED_MERGE_INDEX_OVERHEAD_PER_ROW
+        + sweep_manager_module._FIXED_MERGE_BASE_OVERHEAD_BYTES
+    )
+
+
+def test_fixed_memory_estimate_selects_largest_peak_not_largest_payload(
+    tmp_path: Path,
+) -> None:
+    import pynst.sweep_manager as sweep_manager_module
+
+    def measurement(_params: dict[str, Any]):
+        return {
+            "payload": pd.DataFrame(
+                {"text": ["x" * 300_000]},
+                index=pd.Index([0], name="sample"),
+            ),
+            "many_rows": pd.DataFrame(
+                {"value": np.arange(5000, dtype=np.float64)},
+                index=pd.Index(range(5000), name="sample"),
+            ),
+        }
+
+    manager = SweepManager(
+        measurement_func=measurement,
+        ivars=_grid(1),
+        meas_name="fixed_memory_largest_estimated_peak",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    chunk_files = sorted(manager.output_dir.glob("chunk_*.h5"))
+
+    with pd.HDFStore(chunk_files[0], mode="r") as store:
+        deep_bytes = {
+            name: int(
+                store[f"/{name}"]
+                .memory_usage(index=True, deep=True)
+                .sum()
+            )
+            for name in ("payload", "many_rows")
+        }
+        rows = {
+            name: len(store[f"/{name}"])
+            for name in ("payload", "many_rows")
+        }
+
+    assert deep_bytes["payload"] > deep_bytes["many_rows"]
+    estimated_peaks = {
+        name: (
+            int(
+                np.ceil(
+                    size
+                    * sweep_manager_module._FIXED_MERGE_MEMORY_FACTOR
+                )
+            )
+            + rows[name]
+            * sweep_manager_module._FIXED_MERGE_INDEX_OVERHEAD_PER_ROW
+            + sweep_manager_module._FIXED_MERGE_BASE_OVERHEAD_BYTES
+        )
+        for name, size in deep_bytes.items()
+    }
+    assert estimated_peaks["many_rows"] > estimated_peaks["payload"]
+
+    block, logical_bytes, required_bytes = (
+        manager._fixed_merge_memory_estimate(chunk_files, {})
+    )
+    assert block == "many_rows"
+    assert logical_bytes == deep_bytes["many_rows"]
+    assert required_bytes == estimated_peaks["many_rows"]
+
+
+def test_streaming_prescan_failure_creates_no_target_or_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SweepManager(
+        measurement_func=lambda params: _mapping_result(),
+        ivars=_grid(1, 2),
+        meas_name="streaming_prescan_failure",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    source_before = _snapshot_tree(manager.output_dir)
+    target = tmp_path / "streaming_prescan_failure.h5"
+
+    def fail_prescan(*args: Any, **kwargs: Any):
+        raise OSError("simulated streaming prescan failure")
+
+    monkeypatch.setattr(manager, "_streaming_min_itemsize", fail_prescan)
+    with pytest.raises(OSError, match="streaming prescan failure"):
+        manager.merge(target, strategy="streaming")
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(f".{target.name}.*.pynst_tmp"))
+    assert _snapshot_tree(manager.output_dir) == source_before
+
+
+def test_existing_target_is_rejected_before_fixed_memory_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SweepManager(
+        measurement_func=lambda params: _mapping_result(),
+        ivars=_grid(1),
+        meas_name="existing_target_before_memory_scan",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    target = tmp_path / "existing_before_preflight.h5"
+    sentinel = b"existing target remains authoritative"
+    target.write_bytes(sentinel)
+    monkeypatch.setattr(
+        manager,
+        "_ensure_fixed_merge_memory",
+        lambda *args, **kwargs: pytest.fail(
+            "RAM preflight must not run for an existing target"
+        ),
+    )
+
+    with pytest.raises(FileExistsError, match="already exists|overwrite"):
+        manager.merge(target)
+
+    assert target.read_bytes() == sentinel
+    assert not list(tmp_path.glob(f".{target.name}.*.pynst_tmp"))
+
+
+def test_runtime_memoryerror_keeps_target_and_sources_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pynst.sweep_manager as sweep_manager_module
+
+    manager = SweepManager(
+        measurement_func=lambda params: _mapping_result(),
+        ivars=_grid(1, 2),
+        meas_name="runtime_merge_memoryerror",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    source_before = _snapshot_tree(manager.output_dir)
+    target = tmp_path / "existing_atomic_target.h5"
+    target.write_bytes(b"preexisting target must survive")
+    target_before = target.read_bytes()
+
+    def exhaust_memory(*args: Any, **kwargs: Any):
+        raise MemoryError("simulated pandas concat exhaustion")
+
+    monkeypatch.setattr(sweep_manager_module.pd, "concat", exhaust_memory)
+    with pytest.raises(MemoryError, match="strategy='streaming'|streaming"):
+        manager.merge(target, overwrite=True)
+
+    assert target.read_bytes() == target_before
+    assert _snapshot_tree(manager.output_dir) == source_before
+    assert not list(tmp_path.glob(f".{target.name}.*.pynst_tmp"))
+
+
+@pytest.mark.parametrize("strategy", ["fixed", "streaming"])
+def test_drop_columns_is_consistent_for_both_merge_strategies(
+    tmp_path: Path,
+    strategy: str,
+) -> None:
+    manager = SweepManager(
+        measurement_func=lambda params: {
+            "measurement": pd.DataFrame(
+                {
+                    "keep": [float(params["point"])],
+                    "drop": [-1.0],
+                },
+                index=pd.Index([0], name="sample"),
+            )
+        },
+        ivars=_grid(1, 2),
+        meas_name=f"drop_columns_{strategy}",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    target = tmp_path / f"drop_columns_{strategy}.h5"
+    manager.merge(
+        target,
+        strategy=strategy,  # type: ignore[arg-type]
+        drop_columns={"measurement": ["drop"]},
+    )
+
+    dataset = GenericSweepDataset(target)
+    frame = dataset.get_block("measurement")
+    block = dataset.get_block_metadata("measurement")
+    assert frame.columns.tolist() == ["keep"]
+    assert block.dvars == ["keep"]
+    assert "drop" not in block.variables
+    dataset.validate_storage(deep=True)
+    with pd.HDFStore(target, mode="r") as store:
+        assert store.get_storer("measurement").is_table is (
+            strategy == "streaming"
+        )
+
+
+def test_fixed_strategy_uses_table_fallback_for_categorical_data(
+    tmp_path: Path,
+) -> None:
+    ivars = pd.MultiIndex.from_arrays(
+        [
+            pd.Categorical(
+                ["cold", "hot"],
+                categories=["cold", "nominal", "hot"],
+                ordered=True,
+            )
+        ],
+        names=["state"],
+    )
+    manager = SweepManager(
+        measurement_func=lambda params: _mapping_result(),
+        ivars=ivars,
+        meas_name="fixed_categorical_fallback",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    target = tmp_path / "fixed_categorical_fallback.h5"
+    manager.merge(target, strategy="fixed")
+
+    dataset = GenericSweepDataset(target)
+    frame = dataset.get_block("measurement")
+    state = frame.index.get_level_values("state")
+    assert isinstance(state.dtype, pd.CategoricalDtype)
+    assert state.dtype.categories.tolist() == ["cold", "nominal", "hot"]
+    assert state.dtype.ordered is True
+    dataset.validate_storage(deep=True)
+    with pd.HDFStore(target, mode="r") as store:
+        assert store.get_storer("measurement").is_table is True
+
+
+@pytest.mark.parametrize("strategy", ["fixed", "streaming"])
+@pytest.mark.parametrize(
+    "interrupt_type",
+    [KeyboardInterrupt, SystemExit],
+    ids=["keyboard_interrupt", "system_exit"],
+)
+def test_merge_baseexception_after_temp_creation_is_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    strategy: str,
+    interrupt_type: type[BaseException],
+) -> None:
+    import pynst.sweep_manager as sweep_manager_module
+
+    manager = SweepManager(
+        measurement_func=lambda params: _mapping_result(
+            float(params["point"])
+        ),
+        ivars=_grid(1, 2),
+        meas_name=f"merge_interrupt_{strategy}_{interrupt_type.__name__}",
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert manager.run() is True
+    source_before = _snapshot_tree(manager.output_dir)
+    target = tmp_path / f"interrupt_{strategy}_{interrupt_type.__name__}.h5"
+
+    def interrupt_after_temporary_creation(*args: Any, **kwargs: Any):
+        raise interrupt_type("injected after merge temporary creation")
+
+    monkeypatch.setattr(
+        sweep_manager_module,
+        "tqdm",
+        interrupt_after_temporary_creation,
+    )
+    with pytest.raises(interrupt_type, match="injected"):
+        manager.merge(target, strategy=strategy)  # type: ignore[arg-type]
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(f".{target.name}.*.pynst_tmp"))
+    assert _snapshot_tree(manager.output_dir) == source_before
+
+
+@pytest.mark.parametrize(
+    "merge_phase",
+    ["streaming", "fixed_preflight"],
+)
+def test_v3_table_reconciliation_reads_data_blocks_in_bounded_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    merge_phase: str,
+) -> None:
+    meas_name = f"v3_batched_reconciliation_{merge_phase}"
+    seed = SweepManager(
+        measurement_func=lambda params: _mapping_result(
+            float(params["point"])
+        ),
+        ivars=_grid(1, 2),
+        meas_name=meas_name,
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=False,
+    )
+    assert seed.run() is True
+    chunk_paths = {
+        path.resolve() for path in seed.output_dir.glob("chunk_*.h5")
+    }
+    assert len(chunk_paths) == 2
+    for chunk_path in chunk_paths:
+        with pd.HDFStore(chunk_path, mode="r") as store:
+            assert store.get_storer("measurement").is_table is True
+    seed.close()
+
+    original_getitem = pd.HDFStore.__getitem__
+    original_select = pd.HDFStore.select
+    select_calls: list[tuple[Path, int]] = []
+
+    def guarded_getitem(store: pd.HDFStore, key: str):
+        source = Path(str(store.filename)).resolve()
+        if source in chunk_paths and str(key).strip("/") == "measurement":
+            raise AssertionError(
+                "v3 table reconciliation materialised a complete data block"
+            )
+        return original_getitem(store, key)
+
+    def tracked_select(
+        store: pd.HDFStore,
+        key: str,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        source = Path(str(store.filename)).resolve()
+        if source in chunk_paths and str(key).strip("/") == "measurement":
+            chunksize = kwargs.get("chunksize")
+            assert isinstance(chunksize, int) and chunksize > 0
+            select_calls.append((source, chunksize))
+        return original_select(store, key, *args, **kwargs)
+
+    monkeypatch.setattr(pd.HDFStore, "__getitem__", guarded_getitem)
+    monkeypatch.setattr(pd.HDFStore, "select", tracked_select)
+    resumed = SweepManager(
+        measurement_func=lambda params: pytest.fail(
+            "completed run must not invoke the callback"
+        ),
+        ivars=_grid(1, 2),
+        meas_name=meas_name,
+        output_root=tmp_path,
+        chunk_size=1,
+        resume=True,
+    )
+
+    target = tmp_path / f"{merge_phase}.h5"
+    if merge_phase == "fixed_preflight":
+        def stop_at_preflight(*args: Any, **kwargs: Any):
+            raise MemoryError("fixed preflight sentinel")
+
+        monkeypatch.setattr(
+            resumed,
+            "_ensure_fixed_merge_memory",
+            stop_at_preflight,
+        )
+        with pytest.raises(MemoryError, match="preflight sentinel"):
+            resumed.merge(target, strategy="fixed")
+        assert not target.exists()
+        assert not list(tmp_path.glob(f".{target.name}.*.pynst_tmp"))
+    else:
+        resumed.merge(target, strategy="streaming")
+        GenericSweepDataset(target).validate_storage(deep=True)
+
+    assert select_calls
+    assert {source for source, _ in select_calls} == chunk_paths
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows rename retry only")
