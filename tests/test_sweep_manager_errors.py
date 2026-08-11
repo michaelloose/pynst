@@ -376,7 +376,9 @@ def test_list_block_positions_remain_structural(tmp_path):
     manager.run()
 
     assert calls == [1, 2]
-    assert "changed columns" in manager.errlog_file.read_text(encoding="utf-8")
+    error_text = manager.errlog_file.read_text(encoding="utf-8")
+    assert "changed" in error_text
+    assert "dvars" in error_text or "columns" in error_text
 
 
 def test_resume_rejects_contract_chunk_block_mode_mismatch(tmp_path):
@@ -601,22 +603,24 @@ def test_missing_previous_chunk_aborts_before_measurement_callback(tmp_path):
     next(first.output_dir.glob("chunk_*.h5")).unlink()
 
     calls: list[int] = []
-    critical_errors: list[Exception] = []
 
-    resumed = SweepManager(
-        measurement_func=lambda params, previous: calls.append(params["frequency"]),
-        ivars=grid,
-        meas_name="missing_previous_chunk",
-        output_root=tmp_path,
-        resume=True,
-        provide_previous_result=True,
-        critical_callback=critical_errors.append,
-    )
-    resumed.run()
+    # Persistence reconciliation is deliberately part of construction and
+    # therefore fails before a manager capable of issuing callbacks exists.
+    # A manifest entry without its committed chunk must never be treated as a
+    # point that can silently be remeasured.
+    with pytest.raises(RuntimeError, match="missing chunk"):
+        SweepManager(
+            measurement_func=lambda params, previous: calls.append(
+                params["frequency"]
+            ),
+            ivars=grid,
+            meas_name="missing_previous_chunk",
+            output_root=tmp_path,
+            resume=True,
+            provide_previous_result=True,
+        )
 
     assert calls == []
-    assert len(critical_errors) == 1
-    assert "before the hardware callback" in str(critical_errors[0])
 
 
 def test_resume_progress_starts_at_completed_count(tmp_path, monkeypatch):

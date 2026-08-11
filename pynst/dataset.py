@@ -5,21 +5,92 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import json
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Any, Iterable, Iterator
 
+import numpy as np
 import pandas as pd
 
-from .data_model import BlockMetadata, SweepMetadata
+from .data_model import BlockMetadata, SweepMetadata, json_default
 
 
 _METADATA_PREFIX = "/__metadata__/"
+_MISSING_INDEX_VALUE = object()
 
 
 def _normalise_key(name: str) -> str:
     key = str(name).strip("/")
     if not key:
         raise ValueError("HDF block name must not be empty.")
+    if "/" in key:
+        raise ValueError(
+            "HDF block names must not contain '/'. "
+            f"Received {name!r}."
+        )
     return key
+
+
+def _is_data_block_key(key: str) -> bool:
+    """Exclude pandas-internal nested table metadata from user blocks."""
+    normalised = str(key).strip("/")
+    return (
+        bool(normalised)
+        and "/" not in normalised
+        and not normalised.startswith("__metadata__")
+    )
+
+
+def _data_block_keys(store: pd.HDFStore) -> list[str]:
+    keys = list(store.keys())
+    data_keys = [key for key in keys if _is_data_block_key(key)]
+    top_level = {key.strip("/") for key in data_keys}
+    for key in keys:
+        normalised = key.strip("/")
+        if not normalised or normalised.startswith("__metadata__"):
+            continue
+        if "/" not in normalised:
+            continue
+        parts = normalised.split("/")
+        is_pandas_categorical_metadata = (
+            len(parts) >= 4
+            and parts[0] in top_level
+            and parts[1] == "meta"
+            and parts[-1] == "meta"
+        )
+        if not is_pandas_categorical_metadata:
+            raise ValueError(
+                "HDF block names must not contain nested '/' paths; "
+                f"{key!r} is not pandas categorical metadata."
+            )
+    return data_keys
+
+
+def _dtype_spec(dtype: Any) -> dict[str, Any]:
+    spec: dict[str, Any] = {"dtype": str(dtype)}
+    if isinstance(dtype, pd.CategoricalDtype):
+        spec["categories"] = [
+            json.loads(
+                json.dumps(
+                    value,
+                    default=json_default,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+            for value in dtype.categories.tolist()
+        ]
+        spec["ordered"] = bool(dtype.ordered)
+    return spec
+
+
+def _canonical_index_value(value: Any) -> Any:
+    """Make scalar missing values compare equal across validation chunks."""
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        missing = False
+    if isinstance(missing, (bool, np.bool_)) and bool(missing):
+        return _MISSING_INDEX_VALUE
+    return value
 
 
 class BaseSweepDataset(ABC):
@@ -40,6 +111,11 @@ class BaseSweepDataset(ABC):
         self.file_path = Path(file_path).expanduser().resolve()
         if not self.file_path.exists():
             raise FileNotFoundError(self.file_path)
+        if not self.file_path.is_file():
+            raise ValueError(
+                f"Sweep dataset path must reference a file: "
+                f"{self.file_path}"
+            )
 
         self._block_names: list[str] = []
         self.metadata = self._read_metadata_and_keys()
@@ -51,9 +127,8 @@ class BaseSweepDataset(ABC):
     def _read_metadata_and_keys(self) -> SweepMetadata:
         with pd.HDFStore(self.file_path, mode="r") as store:
             self._block_names = [
-                key.strip("/")
-                for key in store.keys()
-                if not key.startswith(_METADATA_PREFIX)
+                _normalise_key(key)
+                for key in _data_block_keys(store)
             ]
 
             config_key = "/__metadata__/config"
@@ -69,9 +144,8 @@ class BaseSweepDataset(ABC):
                 for block_name in self._block_names:
                     frame = store[f"/{block_name}"]
                     ivars = [
-                        str(name)
-                        for name in frame.index.names
-                        if name is not None
+                        str(name) if name is not None else f"index_{index}"
+                        for index, name in enumerate(frame.index.names)
                     ]
                     block = BlockMetadata(
                         hdf_key=block_name,
@@ -188,9 +262,79 @@ class BaseSweepDataset(ABC):
             frame = store[key]
         return "" if frame.empty else str(frame.iloc[0]["text"])
 
+    @staticmethod
+    def _validate_frame_schema(
+        key: str,
+        frame: pd.DataFrame,
+        block: BlockMetadata,
+    ) -> None:
+        actual_index_names = [
+            str(name) if name is not None else f"index_{index}"
+            for index, name in enumerate(frame.index.names)
+        ]
+        if actual_index_names != block.ivars:
+            raise ValueError(
+                f"{key!r}: stored index names differ from metadata."
+            )
+        if [str(name) for name in frame.columns] != block.dvars:
+            raise ValueError(
+                f"{key!r}: stored columns differ from metadata."
+            )
+        for level, variable_name in enumerate(block.ivars):
+            variable = block.variables.get(variable_name)
+            expected_dtype = None if variable is None else variable.dtype
+            dtype = frame.index.get_level_values(level).dtype
+            actual_dtype = str(dtype)
+            if expected_dtype is not None and actual_dtype != expected_dtype:
+                raise ValueError(
+                    f"{key!r}: index dtype for {variable_name!r} differs "
+                    "from metadata."
+                )
+            actual_spec = _dtype_spec(dtype)
+            for field in ("categories", "ordered"):
+                if (
+                    variable is not None
+                    and field in variable.extra
+                    and variable.extra[field] != actual_spec.get(field)
+                ):
+                    raise ValueError(
+                        f"{key!r}: index categorical {field} for "
+                        f"{variable_name!r} differs from metadata."
+                    )
+        for variable_name in block.dvars:
+            variable = block.variables.get(variable_name)
+            expected_dtype = None if variable is None else variable.dtype
+            dtype = frame[variable_name].dtype
+            actual_dtype = str(dtype)
+            if expected_dtype is not None and actual_dtype != expected_dtype:
+                raise ValueError(
+                    f"{key!r}: column dtype for {variable_name!r} differs "
+                    "from metadata."
+                )
+            actual_spec = _dtype_spec(dtype)
+            for field in ("categories", "ordered"):
+                if (
+                    variable is not None
+                    and field in variable.extra
+                    and variable.extra[field] != actual_spec.get(field)
+                ):
+                    raise ValueError(
+                        f"{key!r}: column categorical {field} for "
+                        f"{variable_name!r} differs from metadata."
+                    )
+
     def validate_storage(self, *, deep: bool = False) -> None:
         """Validate metadata and optionally compare it to stored DataFrames."""
         self.metadata.validate()
+
+        for key, block in self.metadata.blocks.items():
+            normalised_key = _normalise_key(key)
+            normalised_hdf_key = _normalise_key(block.hdf_key)
+            if key != normalised_key or block.hdf_key != normalised_hdf_key:
+                raise ValueError(
+                    f"Invalid metadata block name {key!r} / "
+                    f"{block.hdf_key!r}."
+                )
 
         missing_required = [
             key
@@ -205,20 +349,66 @@ class BaseSweepDataset(ABC):
         if not deep:
             return
 
-        for key in self._block_names:
-            frame = self.get_block(key, start=0, stop=1)
-            block = self.metadata.blocks.get(key)
-            if block is None:
-                continue
+        if self.metadata.schema_version > 0:
+            blocks_without_metadata = sorted(
+                set(self._block_names) - set(self.metadata.blocks)
+            )
+            if blocks_without_metadata:
+                raise ValueError(
+                    "Stored HDF blocks have no metadata entries: "
+                    f"{blocks_without_metadata!r}"
+                )
 
-            if list(frame.index.names) != block.ivars:
-                raise ValueError(
-                    f"{key!r}: stored index names differ from metadata."
-                )
-            if [str(name) for name in frame.columns] != block.dvars:
-                raise ValueError(
-                    f"{key!r}: stored columns differ from metadata."
-                )
+        with pd.HDFStore(self.file_path, mode="r") as store:
+            for key in self._block_names:
+                block = self.metadata.blocks.get(key)
+                if block is None:
+                    continue
+                hdf_key = f"/{key}"
+                storer = store.get_storer(hdf_key)
+                if storer.is_table:
+                    frames: Iterable[pd.DataFrame] = store.select(
+                        hdf_key,
+                        chunksize=100_000,
+                    )
+                else:
+                    frames = (store[hdf_key],)
+
+                seen_index_values: set[Any] = set()
+                observed_rows = 0
+                for frame in frames:
+                    observed_rows += len(frame)
+                    self._validate_frame_schema(key, frame, block)
+                    if not frame.index.is_unique:
+                        raise ValueError(
+                            f"{key!r}: stored index contains duplicate "
+                            "entries."
+                        )
+                    try:
+                        index_values = {
+                            tuple(
+                                _canonical_index_value(value)
+                                for value in row
+                            )
+                            for row in frame.index.to_frame(
+                                index=False
+                            ).itertuples(index=False, name=None)
+                        }
+                    except TypeError as error:
+                        raise ValueError(
+                            f"{key!r}: stored index values must be hashable "
+                            "for exact uniqueness validation."
+                        ) from error
+                    if seen_index_values & index_values:
+                        raise ValueError(
+                            f"{key!r}: stored index contains duplicate "
+                            "entries across table chunks."
+                        )
+                    seen_index_values.update(index_values)
+                if observed_rows == 0:
+                    raise ValueError(
+                        f"{key!r}: stored measurement block is empty."
+                    )
 
     @abstractmethod
     def validate_domain(self) -> None:
