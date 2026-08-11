@@ -33,7 +33,47 @@ This creates:
 /status
 ```
 
-The return mode and block names must remain constant during a sweep.
+The return mode and structure must remain constant during a sweep. Mapping
+block insertion order is irrelevant; list positions are structural.
+
+## Safe resume contract
+
+Each new run writes `sweep_contract.json`. It binds the exact ordered sweep
+grid, parameter names and dtypes, return container type, block names/list
+positions, and the observed DataFrame schema. A declared schema may omit
+dtypes; the observed dtypes are then added without invalidating the original
+declaration on resume.
+
+PyNST deliberately keeps this contract generic. Domain identities such as a
+load-pull plan/model UUID and instrument-specific checks such as a PNA
+frequency axis belong in the domain measurement wrapper.
+
+## Previous valid result
+
+Set `provide_previous_result=True` when the next measurement needs information
+from its immediate valid predecessor:
+
+```python
+def measure(params, previous_result):
+    if previous_result is not None:
+        previous_status = previous_result["status"]
+    # perform measurement
+    return {"measurement": measurement_df, "status": status_df}
+
+manager = SweepManager(
+    measurement_func=measure,
+    ivars=ivars,
+    meas_name="run_001",
+    provide_previous_result=True,
+)
+```
+
+During a normal run the predecessor is the last successfully normalised and
+accepted result. During resume it is restored from the exact complete chunk
+referenced by the log. Failed or partial points never replace it. If the
+referenced result cannot be loaded unambiguously, the sweep aborts before the
+next measurement callback. The callback receives a defensive copy with the
+global sweep levels already attached to each DataFrame index.
 
 ## Metadata
 

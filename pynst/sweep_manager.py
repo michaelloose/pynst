@@ -19,6 +19,7 @@ remain supported.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import copy
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -46,6 +47,8 @@ from .data_model import (
 BlockMode = Literal["list", "mapping"]
 MeasurementResult = Sequence[Any] | Mapping[str, Any]
 BlockMap = dict[str, pd.DataFrame]
+SWEEP_CONTRACT_VERSION = 2
+SUPPORTED_SWEEP_CONTRACT_VERSIONS = {1, SWEEP_CONTRACT_VERSION}
 
 
 class CriticalMeasurementError(Exception):
@@ -399,7 +402,7 @@ class OnDiskChunkManager(DataManager):
 
         progress = tqdm(
             total=len(chunk_files),
-            desc="Removing incomplete data",
+            desc="Cleaning incomplete combinations",
             leave=True,
         )
         for chunk_file in chunk_files:
@@ -514,13 +517,19 @@ class SweepManager:
     """Execute, resume and merge a generic nested parameter sweep.
 
     ``measurement_func`` may return either a legacy sequence or a named
-    mapping. The return mode and block names must remain stable throughout one
-    sweep.
+    mapping. Mapping block names and list positions must remain stable
+    throughout one sweep; mapping insertion order is irrelevant.
+
+    With ``provide_previous_result=True``, the function is called as
+    ``measurement_func(params, previous_result)``. The second argument is
+    ``None`` for the first point and otherwise a defensive copy of the most
+    recent valid tagged result. Resume loads that result from the exact
+    complete chunk referenced by the log before invoking the callback.
     """
 
     def __init__(
         self,
-        measurement_func: Callable[[dict[str, Any]], MeasurementResult],
+        measurement_func: Callable[..., MeasurementResult],
         ivars: pd.MultiIndex,
         meas_name: str,
         resume: bool = True,
@@ -529,6 +538,9 @@ class SweepManager:
         param_col_names: list[str] | None = None,
         critical_callback: Callable[[Exception], None] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        expected_result_schema: Mapping[str, Mapping[str, Any]] | None = None,
+        strict_resume_contract: bool = True,
+        provide_previous_result: bool = False,
     ) -> None:
         if not isinstance(ivars, pd.MultiIndex):
             raise TypeError("ivars must be a pandas MultiIndex.")
@@ -557,6 +569,13 @@ class SweepManager:
         self._already_run = False
         self._block_mode: BlockMode | None = None
         self._expected_result_keys: tuple[str, ...] | None = None
+        self._persisted_block_names: tuple[str, ...] | None = None
+        self.strict_resume_contract = bool(strict_resume_contract)
+        self.provide_previous_result = bool(provide_previous_result)
+        self._declared_result_schema = self._normalise_declared_result_schema(
+            expected_result_schema
+        )
+        self._persisted_result_schema: dict[str, dict[str, Any]] | None = None
 
         output_root_path = (
             Path(output_root)
@@ -566,6 +585,11 @@ class SweepManager:
         self.output_dir = output_root_path / self.meas_name
         self.log_file = self.output_dir / "simlog.tsv"
         self.errlog_file = self.output_dir / "traceback.log"
+        self.contract_file = self.output_dir / "sweep_contract.json"
+
+        existing_resume = self.resume and self.log_file.exists()
+        if existing_resume:
+            self._load_and_validate_sweep_contract()
 
         user_metadata = dict(metadata or {})
         user_blocks = user_metadata.pop("blocks", {})
@@ -592,7 +616,17 @@ class SweepManager:
             output_dir=self.output_dir,
             resume=self.resume,
         )
-        self._block_mode = self.data_manager.block_mode
+        chunk_block_mode = self.data_manager.block_mode
+        if (
+            self._block_mode is not None
+            and chunk_block_mode is not None
+            and self._block_mode != chunk_block_mode
+        ):
+            raise ValueError(
+                "Resume contract block mode differs from the existing chunks: "
+                f"contract={self._block_mode!r}, chunks={chunk_block_mode!r}."
+            )
+        self._block_mode = chunk_block_mode or self._block_mode
 
         def on_chunk_written(
             chunk_idx: int,
@@ -605,9 +639,287 @@ class SweepManager:
                     log.write(
                         f"{row}\t{chunk_filename}\tComplete\n"
                     )
+                    self.log_dict[key] = (chunk_filename, "Complete")
 
         self.data_manager._on_chunk_written = on_chunk_written
         self._prepare_log()
+        if not existing_resume:
+            self._write_sweep_contract(result_schema=self._declared_result_schema)
+
+    @staticmethod
+    def _normalise_declared_result_schema(
+        schema: Mapping[str, Mapping[str, Any]] | None,
+    ) -> dict[str, dict[str, Any]] | None:
+        if schema is None:
+            return None
+        result: dict[str, dict[str, Any]] = {}
+        for raw_name, raw_values in schema.items():
+            name = _normalise_block_name(str(raw_name))
+            values = dict(raw_values)
+            unknown = set(values) - {"index_names", "columns", "dtypes"}
+            if unknown:
+                raise ValueError(
+                    f"Unknown expected-result schema fields for {name!r}: "
+                    f"{sorted(unknown)}"
+                )
+            if "index_names" not in values or "columns" not in values:
+                raise ValueError(
+                    f"Expected-result schema for {name!r} requires "
+                    "index_names and columns"
+                )
+            item = {
+                "index_names": [str(value) for value in values["index_names"]],
+                "columns": [str(value) for value in values["columns"]],
+            }
+            if "dtypes" in values:
+                item["dtypes"] = [str(value) for value in values["dtypes"]]
+                if len(item["dtypes"]) != len(item["columns"]):
+                    raise ValueError(
+                        f"Expected-result dtypes for {name!r} do not match columns"
+                    )
+            result[name] = item
+        if not result:
+            raise ValueError("expected_result_schema must not be empty")
+        return result
+
+    def _sweep_grid_contract(self) -> dict[str, Any]:
+        values = [
+            [json.loads(json.dumps(value, default=json_default)) for value in row]
+            for row in self.multi_index.tolist()
+        ]
+        return {
+            "parameter_names": list(self.param_col_names),
+            "level_dtypes": [
+                str(self.multi_index.get_level_values(index).dtype)
+                for index in range(self.multi_index.nlevels)
+            ],
+            "combination_count": len(values),
+            "combinations": values,
+        }
+
+    def _contract_payload(
+        self,
+        *,
+        result_schema: Mapping[str, Mapping[str, Any]] | None,
+    ) -> dict[str, Any]:
+        if self._expected_result_keys is not None:
+            block_names = list(self._expected_result_keys)
+            if self._block_mode == "mapping":
+                block_names.sort()
+        else:
+            block_names = None
+
+        return {
+            "format_name": "pynst.sweep_contract",
+            "format_version": SWEEP_CONTRACT_VERSION,
+            "measurement_name": self.meas_name,
+            "grid": self._sweep_grid_contract(),
+            "block_mode": self._block_mode,
+            "block_names": block_names,
+            "result_schema": None if result_schema is None else dict(result_schema),
+        }
+
+    def _write_sweep_contract(
+        self,
+        *,
+        result_schema: Mapping[str, Mapping[str, Any]] | None,
+    ) -> None:
+        payload = self._contract_payload(result_schema=result_schema)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.contract_file.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=json_default,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.contract_file)
+
+    def _load_and_validate_sweep_contract(self) -> None:
+        if not self.contract_file.is_file():
+            if self.strict_resume_contract:
+                raise RuntimeError(
+                    "Cannot safely resume this legacy sweep: sweep_contract.json "
+                    "is missing. Start a new run or explicitly set "
+                    "strict_resume_contract=False after manual review."
+                )
+            return
+        payload = json.loads(self.contract_file.read_text(encoding="utf-8"))
+        if payload.get("format_name") != "pynst.sweep_contract":
+            raise ValueError("Resume contract has an unknown format")
+        format_version = int(payload.get("format_version", 0))
+        if format_version not in SUPPORTED_SWEEP_CONTRACT_VERSIONS:
+            raise ValueError("Resume contract has an unsupported version")
+        if payload.get("measurement_name") != self.meas_name:
+            raise ValueError("Resume measurement name differs from its contract")
+        expected_grid = payload.get("grid")
+        actual_grid = self._sweep_grid_contract()
+        if expected_grid != actual_grid:
+            details = []
+            for key in ("parameter_names", "level_dtypes", "combination_count"):
+                if expected_grid.get(key) != actual_grid.get(key):
+                    details.append(
+                        f"{key}: stored={expected_grid.get(key)!r}, "
+                        f"current={actual_grid.get(key)!r}"
+                    )
+            if not details:
+                details.append("parameter combinations/order changed")
+            raise ValueError(
+                "Refusing resume because the sweep grid changed: "
+                + "; ".join(details)
+            )
+        stored_schema = payload.get("result_schema")
+        self._persisted_result_schema = (
+            None
+            if stored_schema is None
+            else self._normalise_declared_result_schema(stored_schema)
+        )
+        stored_mode = payload.get("block_mode")
+        if stored_mode not in {None, "list", "mapping"}:
+            raise ValueError(
+                f"Resume contract contains invalid block mode {stored_mode!r}"
+            )
+        self._block_mode = stored_mode
+
+        raw_block_names = payload.get("block_names")
+        if (
+            raw_block_names is None
+            and format_version == 1
+            and self._persisted_result_schema is not None
+        ):
+            # Version 1 did not persist list slots that contained None. Its
+            # best available fallback is the set of materialised blocks.
+            raw_block_names = list(self._persisted_result_schema)
+        elif raw_block_names is None and stored_mode is not None:
+            raise ValueError(
+                "Resume contract is missing block_names for a known block mode"
+            )
+        if raw_block_names is not None:
+            if not isinstance(raw_block_names, list):
+                raise ValueError("Resume contract block_names must be a list")
+            normalised_names = tuple(
+                _normalise_block_name(str(name)) for name in raw_block_names
+            )
+            if len(normalised_names) != len(set(normalised_names)):
+                raise ValueError("Resume contract contains duplicate block names")
+            if stored_mode == "mapping":
+                normalised_names = tuple(sorted(normalised_names))
+            elif stored_mode == "list" and format_version == 1:
+                normalised_names = tuple(
+                    sorted(normalised_names, key=_block_sort_key)
+                )
+            elif stored_mode == "list":
+                expected_list_names = tuple(
+                    f"block_{index}" for index in range(len(normalised_names))
+                )
+                if normalised_names != expected_list_names:
+                    raise ValueError(
+                        "Resume contract list block positions are invalid: "
+                        f"{normalised_names!r}"
+                    )
+            self._persisted_block_names = normalised_names
+
+        if (
+            self._declared_result_schema is not None
+            and self._persisted_result_schema is not None
+            and not self._schemas_compatible(
+                self._declared_result_schema,
+                self._persisted_result_schema,
+            )
+        ):
+            raise ValueError(
+                "Refusing resume because the declared measurement-result "
+                "schema differs from the persisted schema"
+            )
+        if self._persisted_block_names is not None:
+            self._expected_result_keys = self._persisted_block_names
+
+    @staticmethod
+    def _schemas_compatible(
+        declared: Mapping[str, Mapping[str, Any]],
+        persisted: Mapping[str, Mapping[str, Any]],
+    ) -> bool:
+        """Compare a user declaration with a materialised result schema.
+
+        A declaration may intentionally omit dtypes. Persisting the observed
+        dtypes must not make that same declaration invalid on resume.
+        """
+        if set(declared) != set(persisted):
+            return False
+        for name, declared_block in declared.items():
+            persisted_block = persisted[name]
+            for field in ("index_names", "columns"):
+                if declared_block[field] != persisted_block[field]:
+                    return False
+            if (
+                "dtypes" in declared_block
+                and declared_block["dtypes"] != persisted_block.get("dtypes")
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _result_schema_from_blocks(
+        blocks: Mapping[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        schema: dict[str, dict[str, Any]] = {}
+        for name, value in blocks.items():
+            if value is None:
+                continue
+            if not isinstance(value, pd.DataFrame):
+                raise TypeError(
+                    f"Measurement block {name!r} must be a pandas DataFrame"
+                )
+            schema[name] = {
+                "index_names": [
+                    str(index_name) if index_name is not None else f"index_{index}"
+                    for index, index_name in enumerate(value.index.names)
+                ],
+                "columns": [str(column) for column in value.columns],
+                "dtypes": [str(value[column].dtype) for column in value.columns],
+            }
+        return schema
+
+    def _validate_and_persist_result_schema(
+        self,
+        blocks: Mapping[str, Any],
+    ) -> None:
+        actual = self._result_schema_from_blocks(blocks)
+        expected = self._persisted_result_schema or self._declared_result_schema
+        if expected is not None:
+            for name, expected_block in expected.items():
+                if name not in actual:
+                    raise ValueError(f"Required measurement block {name!r} is missing")
+                actual_block = actual[name]
+                for field in ("index_names", "columns"):
+                    if expected_block[field] != actual_block[field]:
+                        raise ValueError(
+                            f"Measurement block {name!r} changed {field}: "
+                            f"expected {expected_block[field]!r}, "
+                            f"got {actual_block[field]!r}"
+                        )
+                if (
+                    "dtypes" in expected_block
+                    and expected_block["dtypes"] != actual_block["dtypes"]
+                ):
+                    raise ValueError(
+                        f"Measurement block {name!r} changed dtypes: expected "
+                        f"{expected_block['dtypes']!r}, got {actual_block['dtypes']!r}"
+                    )
+            if set(actual) != set(expected):
+                raise ValueError(
+                    "Measurement result block names changed: "
+                    f"expected {tuple(expected)!r}, got {tuple(actual)!r}"
+                )
+        if self._persisted_result_schema is None:
+            self._persisted_result_schema = actual
+            self._write_sweep_contract(result_schema=actual)
 
     def _prepare_log(self) -> None:
         if self.resume and self.log_file.exists():
@@ -619,7 +931,7 @@ class SweepManager:
             ]
             if incomplete:
                 print(
-                    "Resume: removing partial data for "
+                    "Resume: validating and cleaning partial data for "
                     f"{len(incomplete)} combinations."
                 )
                 self.data_manager.remove_incomplete_params_from_chunks(
@@ -629,7 +941,7 @@ class SweepManager:
                 for key in incomplete:
                     self.log_dict.pop(key, None)
             else:
-                print("Resume: all combinations in log are complete.")
+                print("Resume: no incomplete logged combinations found.")
             return
 
         self.log_dict: dict[tuple[str, ...], tuple[str, str]] = {}
@@ -681,6 +993,140 @@ class SweepManager:
                 )
         return results
 
+    @staticmethod
+    def _copy_measurement_result(
+        result: MeasurementResult | None,
+    ) -> MeasurementResult | None:
+        """Return a defensive copy suitable for a measurement callback."""
+        return copy.deepcopy(result)
+
+    def _result_from_tagged_blocks(
+        self,
+        blocks: Mapping[str, pd.DataFrame],
+        mode: BlockMode,
+    ) -> MeasurementResult:
+        if mode == "mapping":
+            names = self._expected_result_keys or tuple(sorted(blocks))
+            return {
+                name: blocks[name].copy(deep=True)
+                for name in names
+                if name in blocks
+            }
+
+        names = self._expected_result_keys
+        if names is None:
+            names = tuple(sorted(blocks, key=_block_sort_key))
+        return [
+            blocks[name].copy(deep=True) if name in blocks else None
+            for name in names
+        ]
+
+    def _load_persisted_result(
+        self,
+        params: Mapping[str, Any],
+        key: tuple[str, ...],
+    ) -> MeasurementResult:
+        """Load one exact, complete predecessor from its referenced chunk."""
+        log_entry = self.log_dict.get(key)
+        if log_entry is None or log_entry[1] != "Complete":
+            raise RuntimeError(
+                f"Previous result {key!r} is not marked Complete in the log"
+            )
+
+        chunk_filename = log_entry[0]
+        relative_chunk = Path(chunk_filename)
+        if relative_chunk.is_absolute() or relative_chunk.name != chunk_filename:
+            raise RuntimeError(
+                f"Invalid chunk reference {chunk_filename!r} for {key!r}"
+            )
+        chunk_path = (self.output_dir / relative_chunk).resolve()
+        if chunk_path.parent != self.output_dir.resolve():
+            raise RuntimeError(
+                f"Chunk reference {chunk_filename!r} escapes the sweep directory"
+            )
+        if not chunk_path.is_file():
+            raise FileNotFoundError(
+                f"Chunk {chunk_filename!r} referenced by {key!r} is missing"
+            )
+
+        selected_blocks: BlockMap = {}
+        with pd.HDFStore(chunk_path, mode="r") as store:
+            try:
+                chunk_mode = str(store.root._v_attrs.pynst_block_mode)
+            except AttributeError:
+                chunk_mode = None
+            if (
+                self._block_mode is not None
+                and chunk_mode is not None
+                and chunk_mode != self._block_mode
+            ):
+                raise RuntimeError(
+                    "Previous-result chunk block mode differs from the resume "
+                    f"contract: {chunk_mode!r} != {self._block_mode!r}"
+                )
+
+            available_names = {
+                hdf_key.strip("/")
+                for hdf_key in store.keys()
+                if not hdf_key.startswith("/__metadata__/")
+            }
+            schema = (
+                self._persisted_result_schema
+                or self._declared_result_schema
+            )
+            expected_materialised = (
+                set(schema) if schema is not None else available_names
+            )
+            if schema is not None and available_names != expected_materialised:
+                raise RuntimeError(
+                    f"Chunk {chunk_filename!r} contains blocks "
+                    f"{sorted(available_names)!r}, expected "
+                    f"{sorted(expected_materialised)!r}"
+                )
+
+            for block_name in sorted(
+                expected_materialised,
+                key=_block_sort_key,
+            ):
+                frame = store[block_name]
+                missing_levels = [
+                    name
+                    for name in self.param_col_names
+                    if name not in frame.index.names
+                ]
+                if missing_levels:
+                    raise RuntimeError(
+                        f"Block {block_name!r} in {chunk_filename!r} is missing "
+                        f"sweep index levels {missing_levels!r}"
+                    )
+
+                index_frame = frame.index.to_frame(index=False)
+                mask = np.ones(len(frame), dtype=bool)
+                for name in self.param_col_names:
+                    value = params[name]
+                    if pd.isna(value):
+                        equal = index_frame[name].isna()
+                    else:
+                        equal = index_frame[name].eq(value).fillna(False)
+                    mask &= np.asarray(equal, dtype=bool)
+                selected = frame.loc[mask]
+                if selected.empty:
+                    raise RuntimeError(
+                        f"Complete result {key!r} has no rows in block "
+                        f"{block_name!r} of {chunk_filename!r}"
+                    )
+                selected_blocks[block_name] = selected.copy(deep=True)
+
+        mode = self._block_mode
+        if mode is None:
+            mode = (
+                "list"
+                if selected_blocks
+                and all(_is_legacy_block_name(name) for name in selected_blocks)
+                else "mapping"
+            )
+        return self._result_from_tagged_blocks(selected_blocks, mode)
+
     def _normalise_measurement_result(
         self,
         result: MeasurementResult,
@@ -711,6 +1157,9 @@ class SweepManager:
             )
 
         keys = tuple(blocks)
+        comparable_keys = (
+            tuple(sorted(keys)) if mode == "mapping" else keys
+        )
         if self._block_mode is None:
             self._block_mode = mode
         elif self._block_mode != mode:
@@ -720,11 +1169,15 @@ class SweepManager:
             )
 
         if self._expected_result_keys is None:
-            self._expected_result_keys = keys
-        elif self._expected_result_keys != keys:
+            self._expected_result_keys = comparable_keys
+        elif self._expected_result_keys != comparable_keys:
+            structure = (
+                "block names" if mode == "mapping" else "block positions"
+            )
             raise ValueError(
-                "measurement_func changed its block names/order. "
-                f"Expected {self._expected_result_keys!r}, got {keys!r}."
+                f"measurement_func changed its {structure}. "
+                f"Expected {self._expected_result_keys!r}, "
+                f"got {comparable_keys!r}."
             )
 
         return mode, blocks
@@ -912,11 +1365,25 @@ class SweepManager:
             )
         self._already_run = True
 
+        completed_count = sum(
+            1
+            for params in self.param_list
+            if self.log_dict.get(
+                tuple(str(params[name]) for name in self.param_col_names),
+                (None, None),
+            )[1] == "Complete"
+        )
         progress = tqdm(
             total=len(self.param_list),
+            initial=completed_count,
             desc="Sweep",
             leave=True,
         )
+
+        previous_result: MeasurementResult | None = None
+        previous_reference: tuple[
+            dict[str, Any], tuple[str, ...]
+        ] | None = None
 
         for params in self.param_list:
             key = tuple(
@@ -927,7 +1394,11 @@ class SweepManager:
                 key in self.log_dict
                 and self.log_dict[key][1] == "Complete"
             ):
-                progress.update(1)
+                if self.provide_previous_result:
+                    # Defer disk I/O until a later point really needs this
+                    # predecessor. A fully complete resume performs no reads.
+                    previous_result = None
+                    previous_reference = (dict(params), key)
                 continue
 
             description = " | ".join(
@@ -937,11 +1408,43 @@ class SweepManager:
             progress.set_description(description)
 
             try:
-                raw_result = self.measurement_func(params)
-                mode, blocks = self._normalise_measurement_result(
-                    raw_result
-                )
-                tagged = self._tag_with_params(blocks, params)
+                if (
+                    self.provide_previous_result
+                    and previous_reference is not None
+                ):
+                    predecessor_params, predecessor_key = previous_reference
+                    try:
+                        previous_result = self._load_persisted_result(
+                            predecessor_params,
+                            predecessor_key,
+                        )
+                    except Exception as error:
+                        raise CriticalMeasurementError(
+                            "Cannot safely load the previous complete result "
+                            "before the next measurement; aborting before the "
+                            f"hardware callback: {error}"
+                        ) from error
+                    previous_reference = None
+
+                if self.provide_previous_result:
+                    raw_result = self.measurement_func(
+                        params,
+                        self._copy_measurement_result(previous_result),
+                    )
+                else:
+                    raw_result = self.measurement_func(params)
+                try:
+                    mode, blocks = self._normalise_measurement_result(
+                        raw_result
+                    )
+                    self._validate_and_persist_result_schema(blocks)
+                    tagged = self._tag_with_params(blocks, params)
+                except Exception as error:
+                    raise CriticalMeasurementError(
+                        "Measurement result normalization/tagging failed "
+                        "after the measurement function returned; aborting "
+                        f"the sweep: {error}"
+                    ) from error
 
                 self.data_manager.add_worker_data(
                     tagged,
@@ -951,6 +1454,12 @@ class SweepManager:
                     },
                     param_keys=[key],
                 )
+                if self.provide_previous_result:
+                    previous_result = self._result_from_tagged_blocks(
+                        tagged,
+                        mode,
+                    )
+                    previous_reference = None
 
             except CriticalMeasurementError as error:
                 progress.write(f"Critical error: {error}")
@@ -974,6 +1483,7 @@ class SweepManager:
                         "\t".join(key)
                         + "\tNA\tFailed\n"
                     )
+                self.log_dict[key] = ("NA", "Failed")
                 self._write_exception("Exception", description)
 
             progress.update(1)
@@ -1265,12 +1775,16 @@ class SweepManager:
         merged_file: str | Path,
         remove_chunks: bool = False,
         force_merge_into_existing: bool = False,
+        drop_columns: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         """Stream chunks into one table-format HDF file.
 
         The output is built in a temporary file and atomically moved into
         place. ``force_merge_into_existing=True`` rebuilds an existing target;
-        it does not append duplicate chunks to it.
+        it does not append duplicate chunks to it. ``drop_columns`` projects
+        named blocks to a stable schema while reading without modifying the
+        source chunks. Block names may be supplied with or without a leading
+        slash, and columns absent from a block are ignored.
         """
         self.data_manager.finalize()
         chunk_files = self.data_manager._chunk_files()
@@ -1281,6 +1795,10 @@ class SweepManager:
             merged_file,
             overwrite=force_merge_into_existing,
         )
+        projected_columns = {
+            "/" + block_name.strip("/"): tuple(columns)
+            for block_name, columns in (drop_columns or {}).items()
+        }
 
         progress = tqdm(
             total=len(chunk_files),
@@ -1303,6 +1821,12 @@ class SweepManager:
                             if key.startswith("/__metadata__/"):
                                 continue
                             frame = source[key]
+                            columns_to_drop = projected_columns.get(key, ())
+                            if columns_to_drop:
+                                frame = frame.drop(
+                                    columns=list(columns_to_drop),
+                                    errors="ignore",
+                                )
                             output.append(
                                 key,
                                 frame,
