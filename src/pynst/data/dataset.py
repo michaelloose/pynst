@@ -10,7 +10,12 @@ from typing import Any, Iterable, Iterator
 import numpy as np
 import pandas as pd
 
-from .model import BlockMetadata, SweepMetadata, json_default
+from ..storage.hdf import (
+    _canonical_hdf_dtype_name,
+    _dtype_spec,
+    _normalise_hdf_string_frame,
+)
+from .model import BlockMetadata, SweepMetadata
 
 
 _METADATA_PREFIX = "/__metadata__/"
@@ -62,24 +67,6 @@ def _data_block_keys(store: pd.HDFStore) -> list[str]:
                 f"{key!r} is not pandas categorical metadata."
             )
     return data_keys
-
-
-def _dtype_spec(dtype: Any) -> dict[str, Any]:
-    spec: dict[str, Any] = {"dtype": str(dtype)}
-    if isinstance(dtype, pd.CategoricalDtype):
-        spec["categories"] = [
-            json.loads(
-                json.dumps(
-                    value,
-                    default=json_default,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                )
-            )
-            for value in dtype.categories.tolist()
-        ]
-        spec["ordered"] = bool(dtype.ordered)
-    return spec
 
 
 def _canonical_index_value(value: Any) -> Any:
@@ -142,7 +129,9 @@ class BaseSweepDataset(ABC):
                 # distinction between global and local independent variables.
                 blocks: dict[str, BlockMetadata] = {}
                 for block_name in self._block_names:
-                    frame = store[f"/{block_name}"]
+                    frame = _normalise_hdf_string_frame(
+                        store[f"/{block_name}"]
+                    )
                     ivars = [
                         str(name) if name is not None else f"index_{index}"
                         for index, name in enumerate(frame.index.names)
@@ -199,14 +188,16 @@ class BaseSweepDataset(ABC):
         with pd.HDFStore(self.file_path, mode="r") as store:
             hdf_key = f"/{key}"
             try:
-                return store.select(
-                    hdf_key,
-                    where=where,
-                    start=start,
-                    stop=stop,
+                return _normalise_hdf_string_frame(
+                    store.select(
+                        hdf_key,
+                        where=where,
+                        start=start,
+                        stop=stop,
+                    )
                 )
             except (TypeError, ValueError, NotImplementedError):
-                frame = store[hdf_key]
+                frame = _normalise_hdf_string_frame(store[hdf_key])
 
         if where is not None:
             raise ValueError(
@@ -252,7 +243,7 @@ class BaseSweepDataset(ABC):
         with pd.HDFStore(self.file_path, mode="r") as store:
             if key not in store.keys():
                 return pd.DataFrame()
-            return store[key]
+            return _normalise_hdf_string_frame(store[key])
 
     def read_traceback(self) -> str:
         key = "/__metadata__/traceback"
@@ -284,7 +275,7 @@ class BaseSweepDataset(ABC):
             variable = block.variables.get(variable_name)
             expected_dtype = None if variable is None else variable.dtype
             dtype = frame.index.get_level_values(level).dtype
-            actual_dtype = str(dtype)
+            actual_dtype = _canonical_hdf_dtype_name(dtype)
             if expected_dtype is not None and actual_dtype != expected_dtype:
                 raise ValueError(
                     f"{key!r}: index dtype for {variable_name!r} differs "
@@ -305,7 +296,7 @@ class BaseSweepDataset(ABC):
             variable = block.variables.get(variable_name)
             expected_dtype = None if variable is None else variable.dtype
             dtype = frame[variable_name].dtype
-            actual_dtype = str(dtype)
+            actual_dtype = _canonical_hdf_dtype_name(dtype)
             if expected_dtype is not None and actual_dtype != expected_dtype:
                 raise ValueError(
                     f"{key!r}: column dtype for {variable_name!r} differs "
@@ -378,6 +369,7 @@ class BaseSweepDataset(ABC):
                 seen_index_values: set[Any] = set()
                 observed_rows = 0
                 for frame in frames:
+                    frame = _normalise_hdf_string_frame(frame)
                     observed_rows += len(frame)
                     self._validate_frame_schema(key, frame, block)
                     if not frame.index.is_unique:

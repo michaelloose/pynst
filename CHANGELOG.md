@@ -26,6 +26,12 @@ series.
   paths remain compatible.
 - Visualization dependencies are optional through `pynst[visualization]`.
 
+### Fixed
+
+- Pandas 3 string inference is normalised at HDF boundaries so sweep grids,
+  result blocks, resume, both merge strategies, and dataset validation retain
+  the Pandas-2-compatible `object` storage schema.
+
 ### Removed
 
 - The unused mandatory `pyserial` dependency.

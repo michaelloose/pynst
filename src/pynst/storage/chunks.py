@@ -16,6 +16,7 @@ from .hdf import (
     _data_block_keys,
     _is_legacy_block_name,
     _normalise_block_name,
+    _normalise_hdf_string_frame,
 )
 from .persistence import _fsync_file, _replace_file
 
@@ -272,6 +273,7 @@ class OnDiskChunkManager(DataManager):
                     axis=0,
                     join="outer",
                 )
+                combined = _normalise_hdf_string_frame(combined)
                 index_columns = list(combined.index.names)
 
                 store.put(
@@ -343,7 +345,9 @@ class OnDiskChunkManager(DataManager):
                     block_name = key.strip("/")
                     if block_name not in block_order:
                         block_order.append(block_name)
-                    block_frames[block_name].append(store[key])
+                    block_frames[block_name].append(
+                        _normalise_hdf_string_frame(store[key])
+                    )
 
         combined: dict[str, pd.DataFrame] = {}
         for block_name in block_order:
@@ -352,6 +356,7 @@ class OnDiskChunkManager(DataManager):
                 axis=0,
                 join="outer",
             )
+            frame = _normalise_hdf_string_frame(frame)
             if not include_nan and frame.isna().all().all():
                 continue
             combined[block_name] = frame
