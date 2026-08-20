@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: >-
+  If you use PyNST in academic work, please cite the software and the
+  corresponding release.
+title: PyNST
+abstract: >-
+  A Python toolkit for planning, executing, persisting, inspecting, and
+  visualizing nested parameter sweeps.
+type: software
+version: 0.4.0
+authors:
+  - family-names: Loose
+    given-names: Michael
+    affiliation: >-
+      Chair of Intelligent Technical Electronics and Systems (LITES),
+      Friedrich-Alexander-Universität Erlangen-Nürnberg (FAU)
+repository-code: https://github.com/michaelloose/pynst
+url: https://pynst.readthedocs.io/
+license: MIT
+keywords:
+  - measurement automation
+  - nested sweep
+  - pandas
+  - MultiIndex
+  - scientific computing

@@ -1,0 +1,9 @@
+include AUTHORS.md
+include CHANGELOG.md
+include CITATION.cff
+include CONTRIBUTING.md
+include .readthedocs.yaml
+
+recursive-include docs *.css *.ipynb *.py *.rst *.txt
+prune docs/_build
+prune docs/.jupyter_cache

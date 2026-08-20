@@ -1,245 +1,191 @@
-# pynst 0.3.0
+# PyNST 0.4.0
 
-Generic nested-sweep execution, chunk storage and HDF5 data model.
+[![Tests](https://github.com/michaelloose/pynst/actions/workflows/tests.yml/badge.svg)](https://github.com/michaelloose/pynst/actions/workflows/tests.yml)
+[![Documentation](https://readthedocs.org/projects/pynst/badge/?version=latest)](https://pynst.readthedocs.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Measurement return values
+PyNST is a domain-independent Python toolkit for planning, executing,
+persisting, inspecting, and visualizing nested parameter sweeps. It combines a
+pandas `MultiIndex` sweep model with crash-consistent chunk storage, strict
+resume validation, and convenient tools for constructing and exploring
+multidimensional measurement plans.
 
-Legacy list mode remains supported:
+PyNST deliberately contains no instrument drivers or RF-specific evaluation.
+Those belong in measurement libraries built on top of its generic APIs.
+
+## Installation
+
+PyNST requires Python 3.10 or newer.
+
+```console
+python -m pip install pynst
+```
+
+Interactive MultiIndex widgets and Matplotlib helpers are optional:
+
+```console
+python -m pip install "pynst[visualization]"
+```
+
+The optional Smith-chart background of ``PointPattern.plot(smith=True)`` is
+available through ``pynst[smith]``.
+
+For development from a source checkout:
+
+```console
+python -m pip install -e ".[dev]"
+```
+
+## A minimal sweep
 
 ```python
-return [measurement_df, status_df]
-```
+from pathlib import Path
 
-This creates:
+import pandas as pd
 
-```text
-/block_0
-/block_1
-```
+from pynst import GenericSweepDataset, SweepManager
+from pynst.planning import create_multiindex, create_range
 
-Named mapping mode is also supported:
 
-```python
-return {
-    "measurement": measurement_df,
-    "status": status_df,
-}
-```
+def measure(params):
+    bias = params["bias"]
+    return {
+        "measurement": pd.DataFrame(
+            {"response": [bias**2]},
+            index=pd.Index([0], name="sample"),
+        )
+    }
 
-This creates:
 
-```text
-/measurement
-/status
-```
+bias = create_range(min=0.0, max=1.0, step=0.25)
+sweep_grid = create_multiindex([bias], names=["bias"])
 
-The return mode and structure must remain constant during a sweep. Mapping
-block insertion order is irrelevant; list positions are structural.
-
-## Safe resume contract
-
-Each new run writes `sweep_contract.json`. It binds the exact ordered sweep
-grid, parameter names and dtypes, return container type, block names/list
-positions, and the observed DataFrame schema. Local-index and dependent-variable
-dtypes are structural; categorical dtypes additionally bind the complete
-category vocabulary and its ordering. A declared schema may omit dtypes; the
-observed dtypes are then added without invalidating the original declaration on
-resume. Sweep values must be finite and serializable by PyNST's generic JSON
-data model. Because pandas HDF cannot persist nullable/string extension arrays
-or complex-valued index levels reliably, result/index extension dtypes other
-than `CategoricalDtype` are rejected before schema binding; represent complex
-indices as separate real/imaginary levels. Complex dependent-variable columns
-remain supported. Object-typed index levels must contain homogeneous strings;
-object dvar columns may additionally contain only missing values. Mixed Python
-object sweep levels are rejected during manager construction; mixed result
-objects are rejected immediately after the callback and before schema binding.
-Unsigned 64-bit index levels are likewise rejected because PyTables cannot
-index them; use a range-checked `int64` or string representation instead.
-
-PyNST deliberately keeps this contract generic. Domain identities such as a
-load-pull plan/model UUID and instrument-specific checks such as a PNA
-frequency axis belong in the domain measurement wrapper.
-
-Every run also owns an atomically updated `run_manifest.json`. The manifest,
-not `simlog.tsv`, is the authority for completed and failed sequence indices.
-Each HDF chunk embeds its run UUID, contract fingerprint, chunk index, block
-structure and exact `sequence_index` list. Resume validates all manifest-owned
-chunks before calling the measurement function, adopts only fully validated
-crash-orphan chunks, and rejects missing, corrupt, overlapping or foreign
-chunks. The TSV log is rebuilt from this state and remains diagnostic only.
-Legacy v1/v2 runs are upgraded through a recoverable two-phase migration, so a
-process stop between contract and manifest replacement does not strand the run.
-
-`sequence_index` is the canonical identity of a grid entry. Parameter string
-representations are never used as storage keys; strings containing tabs or
-otherwise awkward display text therefore remain unambiguous.
-
-The measurement name must be one safe relative path component. A non-blocking
-OS file lock protects each run from concurrent managers, including cleanup,
-resume reconciliation, execution, metadata updates and merge preparation.
-
-`run()` returns `True` only if every contract sequence is committed exactly
-once. Recoverable measurement exceptions leave explicit failed sequences and
-return `False`; schema, persistence and critical measurement errors abort the
-run. `KeyboardInterrupt` and `SystemExit` first attempt to commit already
-accepted buffered data and are then re-raised.
-
-## Previous valid result
-
-Set `provide_previous_result=True` when the next measurement needs information
-from its immediate valid predecessor:
-
-```python
-def measure(params, previous_result):
-    if previous_result is not None:
-        previous_status = previous_result["status"]
-    # perform measurement
-    return {"measurement": measurement_df, "status": status_df}
-
-manager = SweepManager(
+with SweepManager(
     measurement_func=measure,
-    ivars=ivars,
-    meas_name="run_001",
-    provide_previous_result=True,
-)
-```
+    ivars=sweep_grid,
+    meas_name="example_run",
+    output_root=Path("runs"),
+    chunk_size=2,
+    resume=False,
+) as manager:
+    if manager.run():
+        manager.merge("example_run.h5")
 
-During a normal run the predecessor is the last successfully normalised and
-accepted result. During resume it is restored from the exact complete chunk
-referenced by the run manifest. Failed or partial points never replace it. If the
-referenced result cannot be loaded unambiguously, the sweep aborts before the
-next measurement callback. The callback receives a defensive copy with the
-global sweep levels already attached to each DataFrame index.
-
-## Metadata
-
-Global metadata is passed to `SweepManager`:
-
-```python
-manager = SweepManager(
-    measurement_func=measure,
-    ivars=ivars,
-    meas_name="run_001",
-    metadata={
-        "operator": "Michael Loose",
-        "blocks": {
-            "measurement": {
-                "description": "Primary measurement block",
-                "variables": {
-                    "frequency": {"unit": "Hz"},
-                    "gain": {"unit": "dB", "role": "measurement"},
-                },
-            },
-            "waveforms": {
-                "default_load": False,
-            },
-        },
-    },
-)
-```
-
-The following structural fields are generated automatically per block:
-
-- `ivars`
-- `sweep_ivars`
-- `local_ivars`
-- `dvars`
-- variable `dtype`
-
-The following semantic fields are optional:
-
-- `unit`
-- `role`
-- `description`
-- arbitrary additional metadata
-
-Merged files contain:
-
-```text
-/<measurement blocks>
-/__metadata__/config
-/__metadata__/log
-/__metadata__/traceback   # only when errors were recorded
-```
-
-The measurement blocks themselves retain their historical DataFrame format.
-Declared mapping keys or list positions that are always `None` are retained in
-`pynst_result_block_names` metadata and the root `pynst_block_names_json`
-attribute even though they have no materialized HDF block. Embedded log columns
-are namespaced as `parameter:<name>` and `pynst:<field>`.
-
-## Generic dataset
-
-```python
-from pynst import GenericSweepDataset
-
-dataset = GenericSweepDataset("merged.h5")
-
+dataset = GenericSweepDataset("example_run.h5")
 print(dataset.block_names)
-frame = dataset["measurement"]
-block_metadata = dataset.get_block_metadata("measurement")
-log = dataset.read_log()
+print(dataset["measurement"])
 ```
 
-Domain libraries should subclass `BaseSweepDataset` and implement
-`validate_domain()` plus any domain-specific reshaping or processing.
+The callback may return a named mapping of DataFrames, which is recommended,
+or the historical positional list. PyNST prepends the global sweep levels to
+each local DataFrame index and stores the results in bounded HDF5 chunks.
 
-## Merge behaviour
+## Planning sweep points
 
-`merge()` has two explicit strategies:
+The `pynst.planning` package contains the generic point-generation tools that
+previously lived in MultiADSweep:
 
 ```python
-# Default: concatenate one complete block in RAM and write it once.
-manager.merge("merged.h5", strategy="fixed")
-
-# Low-memory path: append bounded batches to HDF tables.
-manager.merge("merged.h5", strategy="streaming")
+from pynst.planning import (
+    PointPattern,
+    combine_multiindexes,
+    create_multiindex,
+    create_range,
+    define_area,
+    define_range,
+    estimate_sweep_time,
+    validate_grid,
+)
 ```
 
-`strategy="fixed"` is the default. It preserves the full MultiIndex and uses
-fixed-format HDF storage whenever pandas can represent the block that way.
-Extension dtypes such as categorical levels transparently fall back to table
-storage. Before creating the output file, PyNST scans the projected source
-table frames in bounded slices (legacy fixed chunks one chunk at a time),
-estimates the peak memory needed for the largest block plus concatenation,
-serialisation and validation overhead, and compares that estimate with
-currently available physical RAM. If the allocation cannot be verified safely,
-it raises `MemoryError` and recommends `strategy="streaming"`; it never changes
-strategy implicitly.
+``define_range`` resolves and validates a range description, while
+``create_range`` returns its samples. The package also supports Cartesian and
+observed MultiIndex combinations, complex point patterns, grid regularity
+reports, and sweep-duration estimates.
 
-`strategy="streaming"` never materialises a complete result block. Its peak
-memory still depends on the configured source chunk size and on the exact
-index set retained during deep validation.
+## Exploring MultiIndex data
 
-Both strategies preserve committed chunk order and therefore produce the same
-row order. After a failed point is filled by a later resume, physical row order
-can differ from the original sweep order; the named MultiIndex, not physical
-row position, is authoritative.
+Selection is available without a graphical backend:
 
-The historical `partial_merge()` API is a deprecated compatibility wrapper
-for `merge(strategy="streaming")`; its old argument order remains supported
-during the deprecation period.
+```python
+from pynst.visualization import MultiIndexSelector
 
-Both strategies write to a temporary file first and replace the target only
-after a successful, durable write. By default they require a complete run;
-`require_complete=False` is the explicit diagnostic escape hatch for a partial
-artifact. Merge targets are locked across runs and may not overwrite chunks or
-run-control files. Random private temporary names prevent collisions with user
-files. `drop_columns` is supported by both strategies and may not remove every
-dependent variable from a block.
+selector = MultiIndexSelector({"response": frame}, axis="columns")
+selected = selector.select(frequency=2.4e9)
+```
 
-`remove_chunks=True` is permitted only for a complete merge. The merged file is
-deeply validated, then its path, hash and size are committed to the manifest as
-an archived artifact before source chunks are retired. Archived runs cannot be
-resumed accidentally. The archive target must be outside the run directory so
-that a later intentional `resume=False` replacement cannot delete the sole
-retained artifact.
+In Jupyter, the same selection model can be controlled with widgets:
 
-## Durability boundary
+```python
+from pynst.visualization import InteractiveMultiIndexPlotter
 
-PyNST guarantees crash-consistent local persistence and at-least-once execution
-of an external measurement callback. No general sweep library can prove that a
-hardware action happened exactly once if the process dies after the instrument
-acted but before the result was durably committed. Measurement functions must
-therefore tolerate a repeated point after such an ambiguous crash. Domain and
-instrument safety checks remain the responsibility of the measurement wrapper.
+plotter = InteractiveMultiIndexPlotter(
+    frame,
+    active_levels=["frequency"],
+)
+plotter.show()
+```
+
+`plot_mi` plots every MultiIndex-labelled column on a normal Matplotlib axis;
+PyNST does not register a custom projection or modify Matplotlib globally:
+
+```python
+import matplotlib.pyplot as plt
+
+from pynst.visualization.matplotlib import plot_mi
+
+fig, ax = plt.subplots()
+plot_mi(x, y, ax=ax, label_levels=["frequency"])
+ax.legend()
+```
+
+## Persistence and resume guarantees
+
+Each run records an ordered sweep contract and an atomically updated manifest.
+Before resuming, PyNST checks the grid, parameter dtypes, result structure,
+DataFrame schemas, run identity, and every committed chunk. Missing, corrupt,
+overlapping, or foreign chunks are rejected before the measurement callback is
+called.
+
+`merge()` offers two explicit strategies:
+
+- `fixed` concatenates a complete block after a memory preflight and usually
+  writes fixed-format HDF5.
+- `streaming` appends bounded batches and avoids materializing a complete block.
+
+Both strategies write a private temporary file and replace the target only
+after successful validation. Existing version-3 files and legacy v1/v2 runs
+remain supported by PyNST 0.4.0.
+
+## Package organization
+
+```text
+pynst.planning       Point and sweep-plan construction
+pynst.execution      Sweep execution and public errors
+pynst.storage        Chunk and persistence infrastructure
+pynst.data           Metadata, datasets, and DataFrame helpers
+pynst.visualization  Optional MultiIndex selection and plotting
+```
+
+Established imports such as `from pynst import SweepManager` and
+`from pynst.dataset import GenericSweepDataset` remain valid.
+
+## Documentation
+
+The complete user guide, API reference, and tutorial notebooks are published at
+[pynst.readthedocs.io](https://pynst.readthedocs.io/). The documentation can be
+built locally with:
+
+```console
+python -m sphinx -W --keep-going -b html docs docs/_build/html
+```
+
+## Project information
+
+PyNST is developed at the Chair of Intelligent Technical Electronics and
+Systems (LITES), Friedrich-Alexander-Universität Erlangen-Nürnberg (FAU).
+Michael Loose is the author and copyright holder; Alexander Deublein is a
+contributor. See [AUTHORS.md](AUTHORS.md), [CONTRIBUTING.md](CONTRIBUTING.md),
+and [CITATION.cff](CITATION.cff).
+
+PyNST is distributed under the [MIT License](LICENSE).

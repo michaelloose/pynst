@@ -690,10 +690,10 @@ def test_deep_dataset_validation_checks_rows_beyond_the_first(
         dataset.validate_storage(deep=True)
 
 
-def test_package_declares_python_39_for_removeprefix_usage() -> None:
-    setup_cfg = Path(__file__).resolve().parents[1] / "setup.cfg"
-    text = setup_cfg.read_text(encoding="utf-8")
-    assert "python_requires = >=3.10" in text
+def test_package_declares_python_310_for_removeprefix_usage() -> None:
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    text = pyproject.read_text(encoding="utf-8")
+    assert 'requires-python = ">=3.10"' in text
 
 
 def test_run_after_close_reacquires_lock_and_respects_active_owner(

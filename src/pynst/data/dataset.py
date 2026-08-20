@@ -10,7 +10,7 @@ from typing import Any, Iterable, Iterator
 import numpy as np
 import pandas as pd
 
-from .data_model import BlockMetadata, SweepMetadata, json_default
+from .model import BlockMetadata, SweepMetadata, json_default
 
 
 _METADATA_PREFIX = "/__metadata__/"

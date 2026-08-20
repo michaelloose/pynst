@@ -1,0 +1,44 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build, verify, and publish to PyPI
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install release dependencies
+        run: python -m pip install -e ".[test,visualization]" build twine
+      - name: Verify tag and package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python -c "import os, pathlib, re; text=pathlib.Path('src/pynst/_version.py').read_text(encoding='utf-8'); version=re.search(r'__version__ = [\"\x27]([^\"\x27]+)', text).group(1); assert os.environ['RELEASE_TAG'] == f'v{version}', f'tag {os.environ[\"RELEASE_TAG\"]!r} does not match version {version!r}'"
+      - name: Run tests
+        run: python -m pytest
+      - name: Build distributions
+        run: python -m build
+      - name: Validate distributions
+        run: python -m twine check dist/*
+      - name: Smoke-test the wheel
+        run: |
+          python -m pip uninstall -y pynst
+          python -m pip install --no-deps dist/*.whl
+          python -c "import pynst; assert pynst.__version__ == '${{ github.ref_name }}'.removeprefix('v')"
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -18,7 +18,6 @@ remain supported.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 import copy
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -41,16 +40,36 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
-from .data_model import (
+from ..data.model import (
     BlockMetadata,
     SweepMetadata,
     VariableMetadata,
     dumps_metadata,
     json_default,
 )
+from ..storage.chunks import BlockMode, DataManager, OnDiskChunkManager
+from ..storage.hdf import (
+    _block_sort_key,
+    _canonical_index_value,
+    _data_block_keys,
+    _dtype_spec,
+    _hdf_object_dtype_issue,
+    _is_legacy_block_name,
+    _normalise_block_name,
+)
+from ..storage.persistence import (
+    _RunLock,
+    _atomic_write_json,
+    _atomic_write_text,
+    _fsync_file,
+    _json_text,
+    _lock_identity,
+    _replace_file,
+    _sha256_file,
+)
+from .errors import CriticalMeasurementError, StorageCommitError
 
 
-BlockMode = Literal["list", "mapping"]
 MergeStrategy = Literal["fixed", "streaming"]
 MeasurementResult = Sequence[Any] | Mapping[str, Any]
 BlockMap = dict[str, pd.DataFrame]
@@ -65,108 +84,6 @@ _FIXED_MERGE_RESERVE_FRACTION = 0.15
 _FIXED_MERGE_SCAN_ROWS = 100_000
 _STREAMING_MERGE_BATCH_ROWS = 100_000
 _CHUNK_VALIDATION_BATCH_ROWS = 100_000
-_MISSING_INDEX_VALUE = object()
-
-
-class CriticalMeasurementError(Exception):
-    """Abort the complete measurement sweep after safely flushing data."""
-
-
-class StorageCommitError(CriticalMeasurementError):
-    """Abort because measurement data could not be committed safely."""
-
-
-class _RunLock:
-    """Cross-platform non-blocking OS lock backed by a persistent file."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._handle: Any | None = None
-
-    @property
-    def acquired(self) -> bool:
-        return self._handle is not None
-
-    def acquire(self) -> None:
-        if self.acquired:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("a+b")
-        try:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"0")
-                handle.flush()
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(
-                    handle.fileno(),
-                    fcntl.LOCK_EX | fcntl.LOCK_NB,
-                )
-        except (OSError, IOError) as error:
-            handle.close()
-            raise RuntimeError(
-                "PyNST run directory is locked by another active manager: "
-                f"{self.path}"
-            ) from error
-        self._handle = handle
-
-    def release(self) -> None:
-        handle = self._handle
-        if handle is None:
-            return
-        self._handle = None
-        try:
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
-
-
-def _fsync_file(path: Path) -> None:
-    # Windows' CRT rejects ``fsync`` on a read-only descriptor with EBADF.
-    # All callers own the file being committed, so opening it read/write is
-    # both safe and portable while still leaving its contents untouched.
-    with path.open("r+b") as handle:
-        os.fsync(handle.fileno())
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _replace_file(temporary: Path, target: Path) -> None:
-    """Atomically replace a file, tolerating brief Windows scanner locks."""
-    delays = (0.02, 0.05, 0.10, 0.25)
-    for attempt in range(len(delays) + 1):
-        try:
-            os.replace(temporary, target)
-            return
-        except PermissionError as error:
-            transient_windows_lock = (
-                os.name == "nt"
-                and getattr(error, "winerror", None) in {5, 32}
-            )
-            if not transient_windows_lock or attempt == len(delays):
-                raise
-            time.sleep(delays[attempt])
 
 
 def _available_memory_bytes() -> int | None:
@@ -214,541 +131,6 @@ def _format_bytes(value: int) -> str:
             return f"{amount:.1f} {unit}"
         amount /= 1024.0
     raise AssertionError("unreachable")
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_bytes(text.encode("utf-8"))
-    _fsync_file(temporary)
-    _replace_file(temporary, path)
-
-
-def _json_text(payload: Mapping[str, Any]) -> str:
-    return (
-        json.dumps(
-            dict(payload),
-            sort_keys=True,
-            separators=(",", ":"),
-            default=json_default,
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-        + "\n"
-    )
-
-
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    _atomic_write_text(path, _json_text(payload))
-
-
-def _normalise_block_name(name: str) -> str:
-    """Validate and normalise a user-defined HDF block name."""
-    if not isinstance(name, str):
-        raise TypeError("Measurement block names must be strings.")
-
-    key = name.strip("/")
-    if not key:
-        raise ValueError("Measurement block names must not be empty.")
-    if "/" in key:
-        raise ValueError(
-            f"Measurement block name {name!r} must not contain '/'."
-        )
-    if key.startswith("__metadata__"):
-        raise ValueError(
-            f"Measurement block name {name!r} uses the reserved "
-            "'__metadata__' prefix."
-        )
-    return key
-
-
-def _is_legacy_block_name(name: str) -> bool:
-    key = str(name).strip("/")
-    return (
-        key.startswith("block_")
-        and key.removeprefix("block_").isdigit()
-    )
-
-
-def _block_sort_key(name: str) -> tuple[int, int | str]:
-    key = str(name).strip("/")
-    if _is_legacy_block_name(key):
-        return (0, int(key.removeprefix("block_")))
-    return (1, key)
-
-
-def _is_data_block_key(key: str) -> bool:
-    """Return whether an HDF key is one top-level user data block.
-
-    Pandas stores categorical table-index metadata below paths such as
-    ``/measurement/meta/category/meta``.  Those nodes are implementation
-    details of the top-level ``/measurement`` block, not additional result
-    blocks.
-    """
-    normalised = str(key).strip("/")
-    return (
-        bool(normalised)
-        and "/" not in normalised
-        and not normalised.startswith("__metadata__")
-    )
-
-
-def _canonical_index_value(value: Any) -> Any:
-    """Make scalar missing values compare equal across validation batches."""
-    try:
-        missing = pd.isna(value)
-    except (TypeError, ValueError):
-        missing = False
-    if isinstance(missing, (bool, np.bool_)) and bool(missing):
-        return _MISSING_INDEX_VALUE
-    return value
-
-
-def _data_block_keys(store: pd.HDFStore) -> list[str]:
-    keys = list(store.keys())
-    data_keys = [key for key in keys if _is_data_block_key(key)]
-    top_level = {key.strip("/") for key in data_keys}
-    for key in keys:
-        normalised = key.strip("/")
-        if not normalised or normalised.startswith("__metadata__"):
-            continue
-        if "/" not in normalised:
-            continue
-        parts = normalised.split("/")
-        is_pandas_categorical_metadata = (
-            len(parts) >= 4
-            and parts[0] in top_level
-            and parts[1] == "meta"
-            and parts[-1] == "meta"
-        )
-        if not is_pandas_categorical_metadata:
-            raise ValueError(
-                "HDF block names must not contain nested '/' paths; "
-                f"{key!r} is not pandas categorical metadata."
-            )
-    return data_keys
-
-
-def _dtype_spec(dtype: Any) -> dict[str, Any]:
-    """Return a JSON-stable dtype identity, including category semantics."""
-    spec: dict[str, Any] = {"dtype": str(dtype)}
-    if isinstance(dtype, pd.CategoricalDtype):
-        spec["categories"] = [
-            json.loads(
-                json.dumps(
-                    value,
-                    default=json_default,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                )
-            )
-            for value in dtype.categories.tolist()
-        ]
-        spec["ordered"] = bool(dtype.ordered)
-    return spec
-
-
-def _lock_identity(path: Path) -> str:
-    text = str(path.expanduser().resolve())
-    return os.path.normcase(text) if os.name == "nt" else text
-
-
-def _hdf_object_dtype_issue(
-    values: Any,
-    label: str,
-    *,
-    allow_empty: bool = False,
-) -> str | None:
-    """Describe object/category values pandas HDF table cannot serialize."""
-    dtype = getattr(values, "dtype", None)
-    if isinstance(dtype, pd.CategoricalDtype):
-        values = dtype.categories
-        dtype = values.dtype
-    if not isinstance(dtype, np.dtype) or dtype != np.dtype("object"):
-        return None
-    inferred = pd.api.types.infer_dtype(values, skipna=True)
-    if inferred in {"string", "unicode"} or (
-        allow_empty and inferred == "empty"
-    ):
-        return None
-    return f"{label}=object[{inferred}]"
-
-
-class DataManager(ABC):
-    """Abstract storage backend used by ``SweepManager``."""
-
-    @abstractmethod
-    def add_worker_data(
-        self,
-        blocks: Mapping[str, pd.DataFrame],
-        metadata: Mapping[str, Any] | None,
-        sequence_indices: list[int],
-    ) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def finalize(self) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_results(
-        self,
-        include_nan: bool = True,
-    ) -> list[Any] | dict[str, pd.DataFrame | None]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def remove_incomplete_params_from_chunks(
-        self,
-        incomplete_keys: list[tuple[str, ...]],
-        param_col_names: list[str],
-    ) -> None:
-        raise NotImplementedError
-
-
-class OnDiskChunkManager(DataManager):
-    """Store tagged measurement blocks in compressed HDF5 chunks."""
-
-    def __init__(
-        self,
-        chunk_size: int = 10,
-        output_dir: str | Path = "chunks",
-        resume: bool = False,
-    ) -> None:
-        if chunk_size < 1:
-            raise ValueError("chunk_size must be at least 1.")
-
-        self.chunk_size = int(chunk_size)
-        self.output_dir = Path(output_dir)
-        self.resume = bool(resume)
-
-        if (
-            not self.resume
-            and self.output_dir.exists()
-            and any(self.output_dir.iterdir())
-        ):
-            raise FileExistsError(
-                "OnDiskChunkManager refuses to remove a non-empty directory. "
-                "Use SweepManager for validated run-directory replacement."
-            )
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        self.worker_count = 0
-        self.df_blocks: dict[str, list[pd.DataFrame]] = defaultdict(list)
-        self.pending_sequence_indices: list[int] = []
-        self.block_metadata: dict[str, dict[str, Any]] = {}
-        self.block_names: tuple[str, ...] | None = None
-        self.run_uuid: str | None = None
-        self.contract_sha256: str | None = None
-
-        self.block_mode: BlockMode | None = self._read_existing_block_mode()
-        if resume:
-            self.block_names = self._read_existing_block_names()
-        self.chunks_written = (
-            self._get_max_existing_chunk_index() + 1
-            if resume
-            else 0
-        )
-
-    def _chunk_files(self) -> list[Path]:
-        """Return completed chunk files and ignore stale *.tmp.h5 files."""
-        indexed: list[tuple[int, Path]] = []
-        for path in self.output_dir.glob("chunk_*.h5"):
-            if path.name.endswith(".tmp.h5"):
-                continue
-            try:
-                index = int(path.stem.removeprefix("chunk_"))
-            except ValueError as error:
-                raise RuntimeError(
-                    f"Invalid final chunk filename {path.name!r}."
-                ) from error
-            indexed.append((index, path))
-        return [path for _, path in sorted(indexed)]
-
-    def _get_max_existing_chunk_index(self) -> int:
-        indices = [
-            int(file_path.stem.removeprefix("chunk_"))
-            for file_path in self._chunk_files()
-        ]
-        return max(indices) if indices else -1
-
-    def _read_existing_block_mode(self) -> BlockMode | None:
-        chunk_files = self._chunk_files()
-        if not chunk_files:
-            return None
-
-        with pd.HDFStore(chunk_files[0], mode="r") as store:
-            try:
-                mode = str(store.root._v_attrs.pynst_block_mode)
-            except AttributeError:
-                keys = [key.strip("/") for key in _data_block_keys(store)]
-                mode = (
-                    "list"
-                    if keys and all(_is_legacy_block_name(k) for k in keys)
-                    else "mapping"
-                )
-
-        if mode not in {"list", "mapping"}:
-            raise ValueError(
-                f"Invalid block mode {mode!r} in existing chunk."
-            )
-        return mode  # type: ignore[return-value]
-
-    def _read_existing_block_names(self) -> tuple[str, ...] | None:
-        chunk_files = self._chunk_files()
-        if not chunk_files:
-            return None
-        with pd.HDFStore(chunk_files[0], mode="r") as store:
-            try:
-                raw = store.root._v_attrs.pynst_block_names_json
-            except AttributeError:
-                return None
-        return tuple(str(name) for name in json.loads(str(raw)))
-
-    def configure_run_identity(
-        self,
-        *,
-        run_uuid: str,
-        contract_sha256: str,
-        block_names: Sequence[str] | None = None,
-    ) -> None:
-        self.run_uuid = str(run_uuid)
-        self.contract_sha256 = str(contract_sha256)
-        if block_names is not None:
-            self.block_names = tuple(str(name) for name in block_names)
-
-    def add_worker_data(
-        self,
-        blocks: Mapping[str, pd.DataFrame],
-        metadata: Mapping[str, Any] | None,
-        sequence_indices: list[int],
-    ) -> None:
-        metadata = dict(metadata or {})
-        incoming_mode = metadata.get("block_mode")
-        incoming_block_names = metadata.get("block_names")
-
-        if incoming_mode is not None:
-            if incoming_mode not in {"list", "mapping"}:
-                raise ValueError(
-                    f"Invalid incoming block mode {incoming_mode!r}."
-                )
-            if self.block_mode is None:
-                self.block_mode = incoming_mode
-            elif self.block_mode != incoming_mode:
-                raise ValueError(
-                    "Measurement return type changed during the sweep: "
-                    f"{self.block_mode!r} -> {incoming_mode!r}."
-                )
-
-        if incoming_block_names is not None:
-            names = tuple(str(name) for name in incoming_block_names)
-            if self.block_names is None:
-                self.block_names = names
-            elif self.block_names != names:
-                raise ValueError(
-                    "Measurement block names/list positions changed during "
-                    f"the sweep: {self.block_names!r} -> {names!r}."
-                )
-
-        incoming_block_metadata = dict(
-            metadata.get("blocks", {}) or {}
-        )
-        for key, values in incoming_block_metadata.items():
-            self.block_metadata[_normalise_block_name(key)] = dict(values)
-
-        for block_name, frame in blocks.items():
-            key = _normalise_block_name(block_name)
-            if not isinstance(frame, pd.DataFrame):
-                raise TypeError(
-                    f"Tagged block {key!r} is not a DataFrame."
-                )
-            self.df_blocks[key].append(frame)
-
-        self.pending_sequence_indices.extend(
-            int(index) for index in sequence_indices
-        )
-        self.worker_count += 1
-
-        if self.worker_count >= self.chunk_size:
-            self._flush_chunk()
-
-    def _flush_chunk(self) -> None:
-        if not self.df_blocks:
-            return
-
-        tmp_path = self.output_dir / (
-            f"chunk_{self.chunks_written}.tmp.h5"
-        )
-        final_path = self.output_dir / (
-            f"chunk_{self.chunks_written}.h5"
-        )
-
-        if final_path.exists():
-            raise FileExistsError(
-                f"Refusing to overwrite existing chunk {final_path}"
-            )
-
-        if tmp_path.exists():
-            tmp_path.unlink()
-
-        with pd.HDFStore(
-            tmp_path,
-            mode="w",
-            complevel=9,
-            complib="blosc",
-        ) as store:
-            store.root._v_attrs.pynst_schema_version = 2
-            store.root._v_attrs.pynst_block_mode = (
-                self.block_mode or "mapping"
-            )
-            store.root._v_attrs.pynst_chunk_index = self.chunks_written
-            store.root._v_attrs.pynst_sequence_indices_json = json.dumps(
-                self.pending_sequence_indices,
-                separators=(",", ":"),
-            )
-            store.root._v_attrs.pynst_block_names_json = json.dumps(
-                list(self.block_names or tuple(self.df_blocks)),
-                separators=(",", ":"),
-            )
-            if self.run_uuid is not None:
-                store.root._v_attrs.pynst_run_uuid = self.run_uuid
-            if self.contract_sha256 is not None:
-                store.root._v_attrs.pynst_contract_sha256 = (
-                    self.contract_sha256
-                )
-
-            for block_name, frames in self.df_blocks.items():
-                combined = pd.concat(
-                    frames,
-                    axis=0,
-                    join="outer",
-                )
-                index_columns = list(combined.index.names)
-
-                store.put(
-                    block_name,
-                    combined,
-                    format="table",
-                    data_columns=index_columns,
-                    complevel=9,
-                    complib="blosc",
-                    min_itemsize=128,
-                )
-
-                block_meta = self.block_metadata.get(block_name)
-                if block_meta is not None:
-                    store.get_storer(block_name).attrs.block_metadata_json = (
-                        json.dumps(
-                            block_meta,
-                            default=json_default,
-                            ensure_ascii=False,
-                        )
-                    )
-
-        _fsync_file(tmp_path)
-        _replace_file(tmp_path, final_path)
-
-        done_indices = list(self.pending_sequence_indices)
-        chunk_index = self.chunks_written
-        self._on_chunk_written(
-            chunk_index,
-            final_path.name,
-            done_indices,
-        )
-        self.pending_sequence_indices.clear()
-        self.df_blocks.clear()
-        self.worker_count = 0
-        self.chunks_written += 1
-
-    def _on_chunk_written(
-        self,
-        chunk_idx: int,
-        chunk_filename: str,
-        sequence_indices: list[int],
-    ) -> None:
-        """Hook replaced by ``SweepManager`` for log-file updates."""
-
-    def finalize(self) -> None:
-        if self.worker_count > 0:
-            self._flush_chunk()
-
-    def get_results(
-        self,
-        include_nan: bool = True,
-    ) -> list[Any] | dict[str, pd.DataFrame | None]:
-        """Load and concatenate all chunks block by block."""
-        block_frames: dict[str, list[pd.DataFrame]] = defaultdict(list)
-        block_order: list[str] = []
-
-        for chunk_file in self._chunk_files():
-            with pd.HDFStore(chunk_file, mode="r") as store:
-                if self.block_mode is None:
-                    try:
-                        self.block_mode = str(
-                            store.root._v_attrs.pynst_block_mode
-                        )  # type: ignore[assignment]
-                    except AttributeError:
-                        pass
-
-                for key in _data_block_keys(store):
-                    block_name = key.strip("/")
-                    if block_name not in block_order:
-                        block_order.append(block_name)
-                    block_frames[block_name].append(store[key])
-
-        combined: dict[str, pd.DataFrame] = {}
-        for block_name in block_order:
-            frame = pd.concat(
-                block_frames[block_name],
-                axis=0,
-                join="outer",
-            )
-            if not include_nan and frame.isna().all().all():
-                continue
-            combined[block_name] = frame
-
-        mode = self.block_mode
-        if mode is None:
-            mode = (
-                "list"
-                if combined
-                and all(_is_legacy_block_name(k) for k in combined)
-                else "mapping"
-            )
-
-        if mode == "mapping":
-            names = self.block_names or tuple(combined)
-            return {name: combined.get(name) for name in names}
-
-        names_for_positions = self.block_names or tuple(combined)
-        indices = [
-            int(name.removeprefix("block_"))
-            for name in names_for_positions
-            if _is_legacy_block_name(name)
-        ]
-        if not indices:
-            return []
-
-        out: list[Any] = []
-        for index in range(max(indices) + 1):
-            key = f"block_{index}"
-            if key in combined:
-                out.append(combined[key])
-            else:
-                out.append(None)
-        return out
-
-    def remove_incomplete_params_from_chunks(
-        self,
-        incomplete_keys: list[tuple[str, ...]],
-        param_col_names: list[str],
-    ) -> None:
-        """Refuse in-place mutation of committed, manifest-owned chunks."""
-        raise RuntimeError(
-            "In-place removal from committed chunks is no longer supported. "
-            "Resume failed points or create an explicit partial merge with "
-            "require_complete=False instead."
-        )
-
 
 class SweepManager:
     """Execute, resume and merge a generic nested parameter sweep.
@@ -3775,7 +3157,7 @@ class SweepManager:
         target: Path,
         chunk_files: Sequence[Path],
     ) -> None:
-        from .dataset import GenericSweepDataset
+        from ..data.dataset import GenericSweepDataset
 
         GenericSweepDataset(target).validate_storage(deep=True)
         self._manifest["state"] = "archived"
@@ -4068,7 +3450,7 @@ class SweepManager:
                     drop_columns=drop_columns,
                 )
 
-            from .dataset import GenericSweepDataset
+            from ..data.dataset import GenericSweepDataset
 
             GenericSweepDataset(temporary).validate_storage(deep=True)
             _fsync_file(temporary)
@@ -4276,7 +3658,7 @@ class SweepManager:
                     drop_columns=drop_columns,
                 )
 
-            from .dataset import GenericSweepDataset
+            from ..data.dataset import GenericSweepDataset
 
             GenericSweepDataset(temporary).validate_storage(deep=True)
             _fsync_file(temporary)
@@ -4352,3 +3734,11 @@ class SweepManager:
             json.loads(metadata_json),
             default_key=key,
         )
+
+__all__ = [
+    "CriticalMeasurementError",
+    "DataManager",
+    "OnDiskChunkManager",
+    "StorageCommitError",
+    "SweepManager",
+]
