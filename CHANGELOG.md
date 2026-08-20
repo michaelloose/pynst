@@ -4,6 +4,13 @@ All notable changes to PyNST are documented in this file. The project follows
 [Semantic Versioning](https://semver.org/) while it is in the `0.x` development
 series.
 
+## [0.4.1] - 2026-08-20
+
+### Fixed
+
+- Corrected the LITES affiliation in the project and citation metadata.
+- Updated the displayed project and citation version for the 0.4.1 release.
+
 ## [0.4.0] - 2026-08-19
 
 ### Added
@@ -41,5 +48,6 @@ series.
 - Crash-consistent chunk persistence, strict resume contracts, deep dataset
   validation, and fixed/streaming merge strategies.
 
+[0.4.1]: https://github.com/michaelloose/pynst/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/michaelloose/pynst/releases/tag/v0.4.0
 [0.3.0]: https://github.com/michaelloose/pynst/commit/1561637
