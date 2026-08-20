@@ -1,7 +1,7 @@
 # Authors and contributors
 
-PyNST is developed at the Chair of Intelligent Technical Electronics and
-Systems (LITES), Friedrich-Alexander-Universität Erlangen-Nürnberg (FAU).
+PyNST is developed at the Chair of Smart Electronics and Systems (LITES),
+Friedrich-Alexander-Universität Erlangen-Nürnberg (FAU).
 
 ## Author and copyright holder
 

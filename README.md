@@ -10,9 +10,6 @@ pandas `MultiIndex` sweep model with crash-consistent chunk storage, strict
 resume validation, and convenient tools for constructing and exploring
 multidimensional measurement plans.
 
-PyNST deliberately contains no instrument drivers or RF-specific evaluation.
-Those belong in measurement libraries built on top of its generic APIs.
-
 ## Installation
 
 PyNST requires Python 3.10 or newer.
@@ -182,8 +179,8 @@ python -m sphinx -W --keep-going -b html docs docs/_build/html
 
 ## Project information
 
-PyNST is developed at the Chair of Intelligent Technical Electronics and
-Systems (LITES), Friedrich-Alexander-Universität Erlangen-Nürnberg (FAU).
+PyNST is developed at the Chair of Smart Electronics and Systems (LITES),
+Friedrich-Alexander-Universität Erlangen-Nürnberg (FAU).
 Michael Loose is the author and copyright holder; Alexander Deublein is a
 contributor. See [AUTHORS.md](AUTHORS.md), [CONTRIBUTING.md](CONTRIBUTING.md),
 and [CITATION.cff](CITATION.cff).
