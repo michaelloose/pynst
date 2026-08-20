@@ -1,0 +1,9 @@
+/* Keep API signatures readable without making narrative pages too narrow. */
+.wy-nav-content {
+  max-width: 1100px;
+}
+
+.rst-content dl.py dt.sig {
+  overflow-x: auto;
+  padding: 0.5rem;
+}

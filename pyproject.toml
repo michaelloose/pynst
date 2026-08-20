@@ -1,3 +1,93 @@
 [build-system]
-requires = ["setuptools>=42"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "pynst"
+dynamic = ["version"]
+description = "Plan, execute, persist, inspect, and visualize nested parameter sweeps"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Michael Loose", email = "michael.loose@fau.de" },
+]
+keywords = [
+    "measurement",
+    "multiindex",
+    "parameter-sweep",
+    "pandas",
+    "scientific-computing",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "tables>=3.8",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+visualization = [
+    "ipywidgets>=8.0",
+    "matplotlib>=3.7",
+]
+smith = [
+    "matplotlib>=3.7",
+    "scikit-rf>=1.0",
+]
+test = [
+    "pytest>=8.0",
+]
+docs = [
+    "myst-nb>=1.1",
+    "sphinx>=8.0",
+    "sphinx-rtd-theme>=3.0",
+]
+dev = [
+    "build>=1.2",
+    "ipywidgets>=8.0",
+    "matplotlib>=3.7",
+    "mypy>=1.10",
+    "myst-nb>=1.1",
+    "pytest>=8.0",
+    "ruff>=0.9",
+    "sphinx>=8.0",
+    "sphinx-rtd-theme>=3.0",
+    "twine>=6.0",
+]
+
+[project.urls]
+Documentation = "https://pynst.readthedocs.io/"
+Issues = "https://github.com/michaelloose/pynst/issues"
+Repository = "https://github.com/michaelloose/pynst"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pynst._version.__version__" }
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
