@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -12,6 +13,91 @@ from ..data.model import json_default
 
 
 _MISSING_INDEX_VALUE = object()
+_PANDAS_STRING_DTYPE_NAMES = frozenset(
+    {"str", "string", "string[python]", "string[pyarrow]"}
+)
+
+
+def _canonical_hdf_dtype_name(dtype: Any) -> str:
+    """Return the stable dtype name used by PyNST's HDF schema.
+
+    Pandas 3 represents ordinary text with ``StringDtype`` by default and
+    also reconstructs legacy HDF object strings that way.  PyNST continues
+    to store those values as the Pandas-2-compatible NumPy ``object`` dtype.
+    """
+    if isinstance(dtype, pd.StringDtype):
+        return "object"
+    name = str(dtype)
+    if name.lower() in _PANDAS_STRING_DTYPE_NAMES:
+        return "object"
+    return name
+
+
+def _normalise_hdf_string_index(index: pd.Index) -> pd.Index:
+    """Return an index whose Pandas string levels use NumPy object dtype."""
+    if isinstance(index, pd.MultiIndex):
+        levels = list(index.levels)
+        changed = False
+        for position, level in enumerate(levels):
+            if not isinstance(level.dtype, pd.StringDtype):
+                continue
+            levels[position] = pd.Index(
+                level.to_numpy(dtype=object),
+                dtype=object,
+                name=level.name,
+            )
+            changed = True
+        if changed:
+            # Replacing levels, rather than rebuilding from row values,
+            # preserves codes, unused levels, ordering and missing entries.
+            return index.set_levels(levels, verify_integrity=True)
+        return index
+
+    if isinstance(index.dtype, pd.StringDtype):
+        return pd.Index(
+            index.to_numpy(dtype=object),
+            dtype=object,
+            name=index.name,
+        )
+    return index
+
+
+def _normalise_hdf_string_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return an HDF-compatible frame without mutating the input frame."""
+    normalised_index = _normalise_hdf_string_index(frame.index)
+    string_columns = [
+        position
+        for position, dtype in enumerate(frame.dtypes)
+        if isinstance(dtype, pd.StringDtype)
+    ]
+    if normalised_index is frame.index and not string_columns:
+        return frame
+
+    normalised = frame.copy(deep=False)
+    if normalised_index is not frame.index:
+        normalised.index = normalised_index
+    for position in string_columns:
+        # Replacing the complete backing array keeps a shallow copy from
+        # mutating a DataFrame returned by the user's measurement callback.
+        normalised.isetitem(
+            position,
+            frame.iloc[:, position].astype(object),
+        )
+    return normalised
+
+
+def _normalise_hdf_string_blocks(
+    blocks: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Canonicalise Pandas string arrays at an HDF storage boundary."""
+    return {
+        name: (
+            _normalise_hdf_string_frame(value)
+            if isinstance(value, pd.DataFrame)
+            else value
+        )
+        for name, value in blocks.items()
+    }
 
 
 def _normalise_block_name(name: str) -> str:
@@ -103,7 +189,7 @@ def _data_block_keys(store: pd.HDFStore) -> list[str]:
 
 def _dtype_spec(dtype: Any) -> dict[str, Any]:
     """Return a JSON-stable dtype identity, including category semantics."""
-    spec: dict[str, Any] = {"dtype": str(dtype)}
+    spec: dict[str, Any] = {"dtype": _canonical_hdf_dtype_name(dtype)}
     if isinstance(dtype, pd.CategoricalDtype):
         spec["categories"] = [
             json.loads(

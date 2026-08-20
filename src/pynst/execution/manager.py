@@ -50,12 +50,16 @@ from ..data.model import (
 from ..storage.chunks import BlockMode, DataManager, OnDiskChunkManager
 from ..storage.hdf import (
     _block_sort_key,
+    _canonical_hdf_dtype_name,
     _canonical_index_value,
     _data_block_keys,
     _dtype_spec,
     _hdf_object_dtype_issue,
     _is_legacy_block_name,
     _normalise_block_name,
+    _normalise_hdf_string_blocks,
+    _normalise_hdf_string_frame,
+    _normalise_hdf_string_index,
 )
 from ..storage.persistence import (
     _RunLock,
@@ -170,6 +174,9 @@ class SweepManager:
                 "Sweep index contains duplicate parameter combinations."
             )
 
+        ivars = _normalise_hdf_string_index(ivars)
+        if not isinstance(ivars, pd.MultiIndex):  # pragma: no cover - defensive
+            raise AssertionError("MultiIndex normalisation changed index type")
         self.measurement_func = measurement_func
         self.multi_index = ivars
         self.param_col_names = list(param_col_names or ivars.names)
@@ -591,14 +598,18 @@ class SweepManager:
                 "columns": [str(value) for value in values["columns"]],
             }
             if "dtypes" in values:
-                item["dtypes"] = [str(value) for value in values["dtypes"]]
+                item["dtypes"] = [
+                    _canonical_hdf_dtype_name(value)
+                    for value in values["dtypes"]
+                ]
                 if len(item["dtypes"]) != len(item["columns"]):
                     raise ValueError(
                         f"Expected-result dtypes for {name!r} do not match columns"
                     )
             if "index_dtypes" in values:
                 item["index_dtypes"] = [
-                    str(value) for value in values["index_dtypes"]
+                    _canonical_hdf_dtype_name(value)
+                    for value in values["index_dtypes"]
                 ]
                 if len(item["index_dtypes"]) != len(item["index_names"]):
                     raise ValueError(
@@ -621,6 +632,8 @@ class SweepManager:
                     raise ValueError(
                         f"Every {field} entry for {name!r} requires dtype"
                     )
+                for spec in specs:
+                    spec["dtype"] = _canonical_hdf_dtype_name(spec["dtype"])
                 item[field] = specs
             result[name] = item
         if not result:
@@ -1023,7 +1036,7 @@ class SweepManager:
 
                 chunk_schema: dict[str, dict[str, Any]] = {}
                 for block_name in materialised_names:
-                    frame = store[block_name]
+                    frame = _normalise_hdf_string_frame(store[block_name])
                     if frame.empty:
                         raise RuntimeError(
                             f"Legacy chunk {chunk_file.name!r} block "
@@ -1137,10 +1150,11 @@ class SweepManager:
     ) -> None:
         """Reject extension dtypes that pandas cannot persist in HDF5.
 
-        CategoricalDtype has a native pandas table representation. Nullable
-        integer/boolean/string and other extension arrays currently have no
-        reliable pandas HDF representation; accepting them would bind the run
-        contract to a schema that can never produce a valid chunk.
+        CategoricalDtype has a native pandas table representation. StringDtype
+        is canonicalised to object before this check. Nullable integer/boolean
+        and other extension arrays currently have no reliable pandas HDF
+        representation; accepting them would bind the run contract to a schema
+        that can never produce a valid chunk.
         """
         unsupported: list[str] = []
         for block_name, value in blocks.items():
@@ -1615,6 +1629,7 @@ class SweepManager:
                 block_sequences: set[int] = set()
                 seen_index_values: set[Any] = set()
                 for frame in frames:
+                    frame = _normalise_hdf_string_frame(frame)
                     observed_rows += len(frame)
                     if not frame.index.is_unique:
                         raise RuntimeError(
@@ -2045,7 +2060,7 @@ class SweepManager:
                 expected_materialised,
                 key=_block_sort_key,
             ):
-                frame = store[block_name]
+                frame = _normalise_hdf_string_frame(store[block_name])
                 missing_levels = [
                     name
                     for name in self.param_col_names
@@ -2228,7 +2243,12 @@ class SweepManager:
                     )
 
             ivars = list(self.param_col_names) + local_ivars
-            tagged_frame = flat.set_index(ivars)
+            # reset_index/set_index may re-infer object string levels as
+            # StringDtype under pandas 3, so canonicalise once more after the
+            # complete tagged index has been built.
+            tagged_frame = _normalise_hdf_string_frame(
+                flat.set_index(ivars)
+            )
 
             if not tagged_frame.index.is_unique:
                 raise ValueError(
@@ -2295,6 +2315,8 @@ class SweepManager:
             actual_spec = _dtype_spec(dtype)
             actual_dtype = actual_spec["dtype"]
             declared_dtype = values.get("dtype")
+            if declared_dtype is not None:
+                declared_dtype = _canonical_hdf_dtype_name(declared_dtype)
             if declared_dtype is not None and declared_dtype != actual_dtype:
                 raise ValueError(
                     f"User metadata for {block_name!r}/{name!r} declares "
@@ -2316,6 +2338,8 @@ class SweepManager:
             actual_spec = _dtype_spec(frame[name].dtype)
             actual_dtype = actual_spec["dtype"]
             declared_dtype = values.get("dtype")
+            if declared_dtype is not None:
+                declared_dtype = _canonical_hdf_dtype_name(declared_dtype)
             if declared_dtype is not None and declared_dtype != actual_dtype:
                 raise ValueError(
                     f"User metadata for {block_name!r}/{name!r} declares "
@@ -2442,6 +2466,9 @@ class SweepManager:
             values = dict(raw_values)
             current = block.variables.get(variable_name, VariableMetadata())
             declared_dtype = values.get("dtype")
+            if declared_dtype is not None:
+                declared_dtype = _canonical_hdf_dtype_name(declared_dtype)
+                values["dtype"] = declared_dtype
             if (
                 declared_dtype is not None
                 and current.dtype is not None
@@ -2539,6 +2566,7 @@ class SweepManager:
                         mode, blocks = self._normalise_measurement_result(
                             raw_result
                         )
+                        blocks = _normalise_hdf_string_blocks(blocks)
                         self._validate_hdf_compatible_blocks(blocks)
                         tagged = self._tag_with_params(blocks, params)
                         # Persist the first observed schema only after all
@@ -2878,6 +2906,7 @@ class SweepManager:
                         NotImplementedError,
                     ):
                         sample = store[key].head(1)
+                    sample = _normalise_hdf_string_frame(sample)
 
                     local_ivars = [
                         name
@@ -3192,13 +3221,20 @@ class SweepManager:
                     else:
                         frames = (source[key],)
                     for frame in frames:
+                        frame = _normalise_hdf_string_frame(frame)
                         columns_to_drop = projected_columns.get(key, ())
                         if columns_to_drop:
                             frame = frame.drop(
                                 columns=list(columns_to_drop),
                                 errors="ignore",
                             )
-                        flat = frame.reset_index()
+                        # pandas 3 may infer StringDtype again while moving an
+                        # object-string index into columns.  The width scan
+                        # must inspect the canonical object representation or
+                        # later UTF-8 values can exceed the first table row.
+                        flat = _normalise_hdf_string_frame(
+                            frame.reset_index()
+                        )
                         block_sizes = required[key]
                         for column in flat.columns:
                             series = flat[column]
@@ -3245,6 +3281,7 @@ class SweepManager:
                     else:
                         frames = (source[key],)
                     for frame in frames:
+                        frame = _normalise_hdf_string_frame(frame)
                         columns_to_drop = projected_columns.get(key, ())
                         if columns_to_drop:
                             frame = frame.drop(
@@ -3425,6 +3462,7 @@ class SweepManager:
                             else:
                                 frames = (source[key],)
                             for frame in frames:
+                                frame = _normalise_hdf_string_frame(frame)
                                 columns_to_drop = projected_columns.get(
                                     key,
                                     (),
@@ -3602,7 +3640,9 @@ class SweepManager:
                             mode="r",
                         ) as source:
                             if hdf_key in source.keys():
-                                frame = source[hdf_key]
+                                frame = _normalise_hdf_string_frame(
+                                    source[hdf_key]
+                                )
                                 columns_to_drop = projected_columns.get(
                                     hdf_key,
                                     (),
@@ -3706,7 +3746,7 @@ class SweepManager:
             key = "/__metadata__/log"
             if key not in store.keys():
                 return pd.DataFrame()
-            return store[key]
+            return _normalise_hdf_string_frame(store[key])
 
     @staticmethod
     def read_merged_block_metadata(
