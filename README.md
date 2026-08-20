@@ -1,4 +1,4 @@
-# PyNST 0.4.1
+# PyNST 0.4.2
 
 [![Tests](https://github.com/michaelloose/pynst/actions/workflows/tests.yml/badge.svg)](https://github.com/michaelloose/pynst/actions/workflows/tests.yml)
 [![Documentation](https://readthedocs.org/projects/pynst/badge/?version=latest)](https://pynst.readthedocs.io/)

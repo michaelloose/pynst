@@ -7,7 +7,7 @@ abstract: >-
   A Python toolkit for planning, executing, persisting, inspecting, and
   visualizing nested parameter sweeps.
 type: software
-version: 0.4.1
+version: 0.4.2
 authors:
   - family-names: Loose
     given-names: Michael
